@@ -393,3 +393,111 @@ The `receiver_reloader` provides:
 - You have a known set of receivers managed via configuration
 - An external system (CI/CD, config management, API) updates the receiver list
 - You want simple, direct control over which receivers run
+
+## Future Improvements
+
+### Using the Collector's confmap System
+
+The OpenTelemetry Collector has a `confmap` package that abstracts configuration reading through a `Provider` interface:
+
+```go
+type Provider interface {
+    Retrieve(ctx context.Context, uri string, watcher WatcherFunc) (*Retrieved, error)
+    Scheme() string
+    Shutdown(ctx context.Context) error
+}
+```
+
+**Built-in providers include:**
+- `file:` - Read from filesystem
+- `env:` - Read from environment variables
+- `http:` / `https:` - Fetch from HTTP endpoints
+- `yaml:` - Inline YAML in the URI
+
+A future version of `receiver_reloader` could potentially use this system instead of hardcoded file watching:
+
+```yaml
+receivers:
+  receiver_reloader:
+    # Current approach
+    file: /etc/otel/dynamic-receivers.yaml
+
+    # Potential future approach using confmap URIs
+    config_uri: file:/etc/otel/dynamic-receivers.yaml
+    # or
+    config_uri: http://config-server.example.com/receivers.yaml
+    # or
+    config_uri: https://vault.example.com/v1/secret/otel-receivers
+```
+
+#### Benefits
+
+1. **Multiple Config Sources**
+   - HTTP/HTTPS endpoints (config servers, APIs)
+   - Cloud storage (S3, GCS, Azure Blob with custom providers)
+   - HashiCorp Vault, Consul, etcd
+   - Environment variables for simple cases
+
+2. **Consistency with Collector**
+   - Uses same config reading patterns as the collector itself
+   - Users already familiar with URI schemes from main config
+   - Leverages existing, tested code
+
+3. **Extensibility**
+   - Custom providers can be added without changing `receiver_reloader`
+   - Community providers would work automatically
+   - `${env:VAR}` expansion could work inside the dynamic config
+
+4. **Better Integration Scenarios**
+   - GitOps: HTTP endpoint serving config from git repo
+   - Service mesh: Config from control plane API
+   - Kubernetes: ConfigMap via HTTP through API server
+
+#### Challenges
+
+1. **Provider Access at Runtime**
+   - Providers are typically set up at collector startup
+   - `receiver_reloader` would need access to the resolver/providers
+   - Current `component.Host` interface doesn't expose confmap providers
+   - Would require a new host capability interface or dependency injection
+
+2. **Watching Not Universally Implemented**
+   - `fileprovider` does NOT watch for changes (reads once)
+   - `httpprovider` does NOT poll for changes
+   - Custom watching/polling logic would still be needed for most providers
+   - The confmap system abstracts "read" but not "watch"
+
+3. **Circular Dependency Risk**
+   - `confmap` is in the core collector module
+   - `receiver_reloader` is in contrib
+   - Adding confmap dependency might create import issues
+
+4. **Configuration Complexity**
+   - Simple file path (`file: /path`) is easier than URI (`config_uri: file:/path`)
+   - Most users just want to point at a file
+   - Risk of over-engineering for the common case
+
+5. **Error Handling Differences**
+   - confmap providers designed for startup-time config loading
+   - `receiver_reloader` needs runtime resilience (retry on failure, graceful degradation)
+
+#### Recommendation
+
+The current file-based approach is kept intentionally simple and covers the primary use case well. If there's demand for HTTP or cloud-based config sources, two paths forward exist:
+
+**Option A: Add HTTP support alongside file support**
+```yaml
+receivers:
+  receiver_reloader:
+    file: /etc/otel/receivers.yaml  # existing file-based
+    # OR
+    http:
+      endpoint: http://config-server/receivers.yaml
+      poll_interval: 30s
+```
+
+**Option B: Wait for collector integration**
+
+Wait for the collector to expose confmap providers through a host capability interface (similar to `hostcapabilities.ComponentFactory`), then integrate cleanly without circular dependencies.
+
+The confmap system is designed for collector-level configuration, not component-level dynamic configuration. Adapting it would require upstream changes that may not be worth the complexity for the current use case.
