@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-package reloadreceiver
+package receiverreloader
 
 import (
 	"context"
@@ -9,16 +9,17 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/receiver/receivertest"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/reloadreceiver/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/receiverreloader/internal/metadata"
 )
 
 func TestNewFactory(t *testing.T) {
 	factory := NewFactory()
-	assert.Equal(t, "reload", factory.Type().String())
+	assert.Equal(t, "receiver_reloader", factory.Type().String())
 }
 
 func TestCreateDefaultConfig(t *testing.T) {
@@ -93,13 +94,13 @@ func TestCreateReceiverInvalidConfig(t *testing.T) {
 
 func TestType(t *testing.T) {
 	factory := NewFactory()
-	assert.Equal(t, "reload", factory.Type().String())
+	assert.Equal(t, "receiver_reloader", factory.Type().String())
 }
 
-func TestComponentLifecycle(t *testing.T) {
+func TestComponentLifecycle_IncompatibleHost(t *testing.T) {
 	factory := NewFactory()
 	cfg := factory.CreateDefaultConfig().(*Config)
-	cfg.File = "/tmp/nonexistent.yaml"
+	cfg.File = "/tmp/test-receivers.yaml"
 
 	recv, err := factory.CreateMetrics(
 		context.Background(),
@@ -109,8 +110,45 @@ func TestComponentLifecycle(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	// Start should fail (either because NopHost doesn't implement
-	// hostcapabilities.ComponentFactory or because file doesn't exist)
+	// Start should fail because NopHost doesn't implement hostcapabilities.ComponentFactory
 	err = recv.Start(context.Background(), componenttest.NewNopHost())
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not compatible with the provided component.Host")
+}
+
+func TestComponentLifecycle_FileDoesNotExist(t *testing.T) {
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig().(*Config)
+	cfg.File = "/tmp/nonexistent-receiver-config-file.yaml"
+
+	recv, err := factory.CreateMetrics(
+		context.Background(),
+		receivertest.NewNopSettings(metadata.Type),
+		cfg,
+		consumertest.NewNop(),
+	)
+	require.NoError(t, err)
+
+	// Start should fail because file doesn't exist
+	host := newMockHostWithFactory()
+	err = recv.Start(context.Background(), host)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to load initial config")
+}
+
+// mockHostWithFactory implements both component.Host and hostcapabilities.ComponentFactory.
+type mockHostWithFactory struct {
+	component.Host
+}
+
+func newMockHostWithFactory() *mockHostWithFactory {
+	return &mockHostWithFactory{}
+}
+
+func (m *mockHostWithFactory) GetExtensions() map[component.ID]component.Component {
+	return nil
+}
+
+func (m *mockHostWithFactory) GetFactory(kind component.Kind, componentType component.Type) component.Factory {
+	return nil
 }

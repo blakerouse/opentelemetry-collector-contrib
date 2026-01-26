@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-package reloadreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/reloadreceiver"
+package receiverreloader // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/receiverreloader"
 
 import (
 	"context"
@@ -11,12 +11,12 @@ import (
 	"go.opentelemetry.io/collector/receiver"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/sharedcomponent"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/reloadreceiver/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/receiverreloader/internal/metadata"
 )
 
 var receivers = sharedcomponent.NewSharedComponents()
 
-// NewFactory creates a factory for the reload receiver.
+// NewFactory creates a factory for the receiver reloader.
 func NewFactory() receiver.Factory {
 	return receiver.NewFactory(
 		metadata.Type,
@@ -38,9 +38,9 @@ func createLogsReceiver(
 	consumer consumer.Logs,
 ) (receiver.Logs, error) {
 	r := receivers.GetOrAdd(cfg, func() component.Component {
-		return newReloadReceiver(params, cfg.(*Config))
+		return newReceiverReloader(params, cfg.(*Config))
 	})
-	r.Component.(*reloadReceiver).nextLogs = consumer
+	r.Component.(*receiverReloader).nextLogs = consumer
 	return r, nil
 }
 
@@ -51,9 +51,9 @@ func createMetricsReceiver(
 	consumer consumer.Metrics,
 ) (receiver.Metrics, error) {
 	r := receivers.GetOrAdd(cfg, func() component.Component {
-		return newReloadReceiver(params, cfg.(*Config))
+		return newReceiverReloader(params, cfg.(*Config))
 	})
-	r.Component.(*reloadReceiver).nextMetrics = consumer
+	r.Component.(*receiverReloader).nextMetrics = consumer
 	return r, nil
 }
 
@@ -64,8 +64,8 @@ func createTracesReceiver(
 	consumer consumer.Traces,
 ) (receiver.Traces, error) {
 	r := receivers.GetOrAdd(cfg, func() component.Component {
-		return newReloadReceiver(params, cfg.(*Config))
+		return newReceiverReloader(params, cfg.(*Config))
 	})
-	r.Component.(*reloadReceiver).nextTraces = consumer
+	r.Component.(*receiverReloader).nextTraces = consumer
 	return r, nil
 }

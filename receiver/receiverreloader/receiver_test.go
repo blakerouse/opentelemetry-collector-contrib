@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-package reloadreceiver
+package receiverreloader
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 	"go.opentelemetry.io/collector/receiver"
 	"go.opentelemetry.io/collector/receiver/receivertest"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/reloadreceiver/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/receiverreloader/internal/metadata"
 )
 
 // mockHost implements the host interface for testing.
@@ -56,7 +56,7 @@ func TestReceiverStartShutdown(t *testing.T) {
 		File: configFile,
 	}
 
-	r := newReloadReceiver(receivertest.NewNopSettings(metadata.Type), cfg)
+	r := newReceiverReloader(receivertest.NewNopSettings(metadata.Type), cfg)
 	r.nextMetrics = consumertest.NewNop()
 
 	host := newMockHost()
@@ -75,7 +75,7 @@ func TestReceiverStartFailsWithMissingFile(t *testing.T) {
 		File: "/nonexistent/path/receivers.yaml",
 	}
 
-	r := newReloadReceiver(receivertest.NewNopSettings(metadata.Type), cfg)
+	r := newReceiverReloader(receivertest.NewNopSettings(metadata.Type), cfg)
 	r.nextMetrics = consumertest.NewNop()
 
 	host := newMockHost()
@@ -97,7 +97,7 @@ func TestReceiverStartFailsWithInvalidYAML(t *testing.T) {
 		File: configFile,
 	}
 
-	r := newReloadReceiver(receivertest.NewNopSettings(metadata.Type), cfg)
+	r := newReceiverReloader(receivertest.NewNopSettings(metadata.Type), cfg)
 	r.nextMetrics = consumertest.NewNop()
 
 	host := newMockHost()

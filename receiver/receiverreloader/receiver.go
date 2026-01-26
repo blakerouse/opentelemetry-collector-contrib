@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-package reloadreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/reloadreceiver"
+package receiverreloader // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/receiverreloader"
 
 import (
 	"context"
@@ -22,14 +22,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// host is the interface that the component.Host passed to reloadreceiver must implement.
+// host is the interface that the component.Host passed to receiverreloader must implement.
 type host interface {
 	component.Host
 	hostcapabilities.ComponentFactory
 }
 
-// reloadReceiver manages a set of dynamically configured receivers.
-type reloadReceiver struct {
+// receiverReloader dynamically manages other receivers based on a watched configuration file.
+type receiverReloader struct {
 	cfg    *Config
 	params receiver.Settings
 	host   host
@@ -45,8 +45,8 @@ type reloadReceiver struct {
 	cancel          context.CancelFunc
 }
 
-func newReloadReceiver(params receiver.Settings, cfg *Config) *reloadReceiver {
-	return &reloadReceiver{
+func newReceiverReloader(params receiver.Settings, cfg *Config) *receiverReloader {
+	return &receiverReloader{
 		cfg:             cfg,
 		params:          params,
 		receivers:       make(map[string]*wrappedReceiver),
@@ -54,11 +54,11 @@ func newReloadReceiver(params receiver.Settings, cfg *Config) *reloadReceiver {
 	}
 }
 
-// Start begins the reload receiver.
-func (r *reloadReceiver) Start(ctx context.Context, h component.Host) error {
+// Start begins the receiver reloader.
+func (r *receiverReloader) Start(ctx context.Context, h component.Host) error {
 	rHost, ok := h.(host)
 	if !ok {
-		return errors.New("the reload receiver is not compatible with the provided component.Host")
+		return errors.New("the receiver reloader is not compatible with the provided component.Host")
 	}
 	r.host = rHost
 
@@ -79,12 +79,12 @@ func (r *reloadReceiver) Start(ctx context.Context, h component.Host) error {
 	}
 	go r.watchLoop(watchCtx, changes)
 
-	r.params.Logger.Info("reload receiver started", zap.String("file", r.cfg.File))
+	r.params.Logger.Info("receiver reloader started", zap.String("file", r.cfg.File))
 	return nil
 }
 
-// Shutdown stops the reload receiver and all managed receivers.
-func (r *reloadReceiver) Shutdown(ctx context.Context) error {
+// Shutdown stops the receiver reloader and all managed receivers.
+func (r *receiverReloader) Shutdown(ctx context.Context) error {
 	if r.cancel != nil {
 		r.cancel()
 	}
@@ -110,7 +110,7 @@ func (r *reloadReceiver) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func (r *reloadReceiver) watchLoop(ctx context.Context, changes <-chan struct{}) {
+func (r *receiverReloader) watchLoop(ctx context.Context, changes <-chan struct{}) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -127,7 +127,7 @@ func (r *reloadReceiver) watchLoop(ctx context.Context, changes <-chan struct{})
 	}
 }
 
-func (r *reloadReceiver) loadAndApply() error {
+func (r *receiverReloader) loadAndApply() error {
 	data, err := os.ReadFile(r.cfg.File)
 	if err != nil {
 		return fmt.Errorf("failed to read file: %w", err)
@@ -145,7 +145,7 @@ func (r *reloadReceiver) loadAndApply() error {
 	return r.applyConfig(dynamicCfg.Receivers)
 }
 
-func (r *reloadReceiver) applyConfig(newConfigs map[string]map[string]any) error {
+func (r *receiverReloader) applyConfig(newConfigs map[string]map[string]any) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -191,7 +191,7 @@ func (r *reloadReceiver) applyConfig(newConfigs map[string]map[string]any) error
 	return nil
 }
 
-func (r *reloadReceiver) startReceiverLocked(id string, cfg map[string]any) error {
+func (r *receiverReloader) startReceiverLocked(id string, cfg map[string]any) error {
 	// Parse receiver ID to get type
 	receiverID := component.ID{}
 	if err := receiverID.UnmarshalText([]byte(id)); err != nil {
@@ -291,7 +291,7 @@ func (r *reloadReceiver) startReceiverLocked(id string, cfg map[string]any) erro
 	return nil
 }
 
-func (r *reloadReceiver) stopReceiverLocked(id string) error {
+func (r *receiverReloader) stopReceiverLocked(id string) error {
 	rcvr, exists := r.receivers[id]
 	if !exists {
 		return nil

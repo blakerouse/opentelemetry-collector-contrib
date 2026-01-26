@@ -1,4 +1,4 @@
-type: reload
+type: receiver_reloader
 
 status:
   class: receiver
