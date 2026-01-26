@@ -275,6 +275,121 @@ Adding configuration file watching to `receiver_creator` would require:
 
 This would add significant complexity to `receiver_creator` while making its codebase harder to understand and maintain.
 
+### What a Hypothetical config_observer Would Look Like
+
+To illustrate why this approach doesn't work well, here's what a hypothetical `config_observer` integration with `receiver_creator` might look like:
+
+```yaml
+# otel-collector.yaml
+extensions:
+  # Hypothetical config_observer that watches a file and emits
+  # each receiver entry as an "endpoint"
+  config_observer:
+    file: /etc/otel/dynamic-receivers.yaml
+
+receivers:
+  receiver_creator:
+    watch_observers: [config_observer]
+    receivers:
+      # Problem 1: You need a rule for EVERY possible receiver type
+
+      redis:
+        rule: type == "redis"
+        config:
+          # Problem 2: Config expansion expects flat endpoint attributes
+          # but receiver configs are arbitrarily nested structures
+          endpoint: '`endpoint`'
+          collection_interval: '`collection_interval`'
+
+      postgresql:
+        rule: type == "postgresql"
+        config:
+          endpoint: '`endpoint`'
+          username: '`username`'
+          password: '`password`'
+          databases: '`databases`'  # How do you template an array?
+
+      prometheus:
+        rule: type == "prometheus"
+        config:
+          # Problem 3: Deeply nested config is impossible to template
+          config:
+            scrape_configs: '`???`'  # This can't work
+
+      filelog:
+        rule: type == "filelog"
+        config:
+          include: '`include`'  # Array of paths
+          operators: '`operators`'  # Array of complex objects - impossible
+
+      # Problem 4: Must pre-define rules for every receiver type
+      # you might ever want to use dynamically
+      hostmetrics:
+        rule: type == "hostmetrics"
+        config:
+          collection_interval: '`collection_interval`'
+          scrapers: '`scrapers`'  # Nested map - can't template
+```
+
+```yaml
+# /etc/otel/dynamic-receivers.yaml
+# Problem 5: This format doesn't match what receiver_creator expects
+receivers:
+  redis/prod-1:
+    endpoint: redis-1.example.com:6379
+    collection_interval: 30s
+
+  prometheus/api:
+    config:
+      scrape_configs:
+        - job_name: 'api-servers'
+          static_configs:
+            - targets: ['api-1:9090', 'api-2:9090']
+```
+
+#### Why This Approach Fails
+
+1. **Flat vs. Nested**: `receiver_creator`'s config expansion uses flat endpoint attributes (`endpoint.pod.name`, `endpoint.port`). Receiver configs are arbitrarily nested structures that can't be flattened.
+
+2. **Pre-defined Rules**: You'd need to define a rule and config template for every receiver type you might use, defeating the purpose of dynamic configuration.
+
+3. **Complex Types**: Arrays, maps, and nested objects can't be templated through the endpoint attribute system.
+
+4. **Identity Mismatch**: The observer pattern tracks endpoints by identity (pod UID, container ID). Config-based receivers need to be tracked by config equality.
+
+5. **Double the Work**: Even if it worked, you'd need to write the config file AND maintain the receiver_creator rules.
+
+#### Compare to receiver_reloader
+
+```yaml
+# otel-collector.yaml - Simple and clean
+receivers:
+  receiver_reloader:
+    file: /etc/otel/dynamic-receivers.yaml
+
+service:
+  pipelines:
+    metrics:
+      receivers: [receiver_reloader]
+```
+
+```yaml
+# /etc/otel/dynamic-receivers.yaml - Just write normal receiver configs
+receivers:
+  redis/prod-1:
+    endpoint: redis-1.example.com:6379
+    collection_interval: 30s
+
+  prometheus/api:
+    config:
+      scrape_configs:
+        - job_name: 'api-servers'
+          static_configs:
+            - targets: ['api-1:9090', 'api-2:9090']
+```
+
+No rules, no templating, no pre-defining receiver types - just write the receiver configs directly.
+
 ### Benefits of a Separate Component
 
 The `receiver_reloader` provides:
