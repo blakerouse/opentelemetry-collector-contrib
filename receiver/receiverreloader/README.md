@@ -322,29 +322,11 @@ receivers:
           include: '`include`'  # Array of paths
           operators: '`operators`'  # Array of complex objects - impossible
 
-      # Problem 4: Must pre-define rules for every receiver type
-      # you might ever want to use dynamically
       hostmetrics:
         rule: type == "hostmetrics"
         config:
           collection_interval: '`collection_interval`'
           scrapers: '`scrapers`'  # Nested map - can't template
-```
-
-```yaml
-# /etc/otel/dynamic-receivers.yaml
-# Problem 5: This format doesn't match what receiver_creator expects
-receivers:
-  redis/prod-1:
-    endpoint: redis-1.example.com:6379
-    collection_interval: 30s
-
-  prometheus/api:
-    config:
-      scrape_configs:
-        - job_name: 'api-servers'
-          static_configs:
-            - targets: ['api-1:9090', 'api-2:9090']
 ```
 
 #### Why This Approach Fails
