@@ -101,67 +101,105 @@ func (e *elasticsearchExporter) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func (e *elasticsearchExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
-	defaultMappingMode, err := e.getRequestMappingMode(ctx)
+// The push*Data functions are the legacy (consumer-goroutine) path: they stream
+// each record to bulk indexer sessions via a sessionSink and flush. The
+// encode*Records functions are the early (ingest-goroutine) path: they collect
+// each record into []encodedItem via an itemSink for the request queue. Both are
+// thin wrappers over pushStreaming/collectItems and the per-signal emit*
+// iteration, so document encoding lives in one place; only the sink differs.
+
+// pushStreaming runs a per-signal emit against streaming bulk indexer sessions
+// (the legacy path) and flushes. emit is a bound *elasticsearchExporter method.
+func pushStreaming[T any](
+	ctx context.Context,
+	e *elasticsearchExporter,
+	emit func(context.Context, docSink, T) ([]error, error),
+	data T,
+) error {
+	var sessions encodedSessionSet
+	sessions.init(e)
+	defer sessions.end()
+	errs, err := emit(ctx, sessionSink{sessions: &sessions}, data)
 	if err != nil {
 		return err
 	}
-	mappingModeSessions := mappingModeSessions{indexers: &e.bulkIndexers.modes}
-	defer mappingModeSessions.End()
+	return flushSessions(ctx, &sessions, errs)
+}
 
-	var errs []error
+// collectItems runs a per-signal emit against a buffering itemSink (the early
+// path), returning the materialized items. capacity is a preallocation hint.
+func collectItems[T any](
+	ctx context.Context,
+	emit func(context.Context, docSink, T) ([]error, error),
+	data T,
+	capacity int,
+) ([]encodedItem, []error, error) {
+	sink := &itemSink{items: make([]encodedItem, 0, capacity)}
+	perRecordErrs, err := emit(ctx, sink, data)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sink.items, perRecordErrs, nil
+}
+
+func (e *elasticsearchExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
+	return pushStreaming(ctx, e, e.emitLogs, ld)
+}
+
+func (e *elasticsearchExporter) encodeLogRecords(ctx context.Context, ld plog.Logs) ([]encodedItem, []error, error) {
+	return collectItems(ctx, e.emitLogs, ld, ld.LogRecordCount())
+}
+
+// emitLogs iterates ld, encoding each log record and handing it to sink.
+// perRecordErrs are deterministic per-record errors that both the streamed and
+// ingest paths return to the caller; a returned error aborts the whole batch.
+func (e *elasticsearchExporter) emitLogs(ctx context.Context, sink docSink, ld plog.Logs) ([]error, error) {
+	defaultMappingMode, err := e.getRequestMappingMode(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var perRecordErrs []error
 	for _, rl := range ld.ResourceLogs().All() {
 		resource := rl.Resource()
 		for _, ill := range rl.ScopeLogs().All() {
 			scope := ill.Scope()
 			mappingMode, err := e.getScopeMappingMode(scope, defaultMappingMode)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			session := mappingModeSessions.StartSession(ctx, mappingMode)
 			router := e.documentRouters[int(mappingMode)]
 			encoder := e.documentEncoders[int(mappingMode)]
-
 			ec := encodingContext{
 				resource:          resource,
 				resourceSchemaURL: rl.SchemaUrl(),
 				scope:             scope,
 				scopeSchemaURL:    ill.SchemaUrl(),
 			}
-
 			for _, lr := range ill.LogRecords().All() {
-				if err := e.pushLogRecord(ctx, router, encoder, ec, lr, session); err != nil {
+				if err := e.emitLogRecord(ctx, sink, router, encoder, ec, lr, mappingMode); err != nil {
 					if cerr := ctx.Err(); cerr != nil {
-						return cerr
+						return nil, cerr
 					}
-
 					if errors.Is(err, ErrInvalidTypeForBodyMapMode) {
 						e.set.Logger.Warn("dropping log record", zap.Error(err))
 						continue
 					}
-
-					errs = append(errs, err)
+					perRecordErrs = append(perRecordErrs, err)
 				}
 			}
 		}
 	}
-
-	if err := mappingModeSessions.Flush(ctx); err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return cerr
-		}
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+	return perRecordErrs, nil
 }
 
-func (e *elasticsearchExporter) pushLogRecord(
+func (e *elasticsearchExporter) emitLogRecord(
 	ctx context.Context,
+	sink docSink,
 	router documentRouter,
 	encoder documentEncoder,
 	ec encodingContext,
 	record plog.LogRecord,
-	bulkIndexerSession bulkIndexerSession,
+	mappingMode MappingMode,
 ) error {
 	ctrl := extractControlAttrs(record.Attributes(), e.config.LogsDynamicID.Enabled, e.config.LogsDynamicPipeline.Enabled)
 	if ctrl.noindex {
@@ -171,17 +209,32 @@ func (e *elasticsearchExporter) pushLogRecord(
 	if err != nil {
 		return err
 	}
-
 	buf := e.bufferPool.NewPooledBuffer()
-	docID := ctrl.docID
-	pipeline := ctrl.pipeline
 	if err := encoder.encodeLog(ec, record, index, buf.Buffer); err != nil {
 		buf.Recycle()
 		return fmt.Errorf("failed to encode log event: %w", err)
 	}
+	return sink.add(ctx, encodedItem{
+		index:       index.Index,
+		docID:       ctrl.docID,
+		pipeline:    ctrl.pipeline,
+		action:      docappender.ActionCreate,
+		mappingMode: mappingMode,
+		target:      targetDefault,
+	}, pooledDoc(buf))
+}
 
-	// not recycling after Add returns an error as we don't know if it's already recycled
-	return bulkIndexerSession.Add(ctx, index.Index, docID, pipeline, buf, nil, docappender.ActionCreate)
+// flushSessions flushes all bulk indexer sessions started while streaming and
+// joins the flush error into errs, honoring context cancellation. It is the
+// shared tail of the legacy push*Data consumers.
+func flushSessions(ctx context.Context, sessions *encodedSessionSet, errs []error) error {
+	if err := sessions.flush(ctx); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 type dataPointsGroup struct {
@@ -197,12 +250,23 @@ func (p *dataPointsGroup) addDataPoint(dp datapoints.DataPoint) {
 }
 
 func (e *elasticsearchExporter) pushMetricsData(ctx context.Context, metrics pmetric.Metrics) error {
+	return pushStreaming(ctx, e, e.emitMetrics, metrics)
+}
+
+func (e *elasticsearchExporter) encodeMetricRecords(ctx context.Context, metrics pmetric.Metrics) ([]encodedItem, []error, error) {
+	// The document count is the number of data point groups, not known until
+	// grouping completes inside emitMetrics, so no useful preallocation hint here.
+	return collectItems(ctx, e.emitMetrics, metrics, 0)
+}
+
+// emitMetrics groups data points into documents, then encodes each group and
+// hands it to sink. Validation errors are logged (not returned) so upstream does
+// not retry; other per-record errors are returned via perRecordErrs.
+func (e *elasticsearchExporter) emitMetrics(ctx context.Context, sink docSink, metrics pmetric.Metrics) ([]error, error) {
 	defaultMappingMode, err := e.getRequestMappingMode(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	sessions := mappingModeSessions{indexers: &e.bulkIndexers.modes}
-	defer sessions.End()
 
 	type mappingIndexKey struct {
 		mappingMode MappingMode
@@ -213,7 +277,7 @@ func (e *elasticsearchExporter) pushMetricsData(ctx context.Context, metrics pme
 	groupedDataPointsByIndex := make(map[mappingIndexKey]map[metricgroup.HashKey]*dataPointsGroup)
 
 	var validationErrs []error // log instead of returning these so that upstream does not retry
-	var errs []error
+	var perRecordErrs []error
 	for _, resourceMetrics := range metrics.ResourceMetrics().All() {
 		resource := resourceMetrics.Resource()
 		var hasher metricgroup.DataPointHasher
@@ -222,7 +286,7 @@ func (e *elasticsearchExporter) pushMetricsData(ctx context.Context, metrics pme
 			scope := scopeMetrics.Scope()
 			mappingMode, err := e.getScopeMappingMode(scope, defaultMappingMode)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			router := e.documentRouters[int(mappingMode)]
 			if hasher == nil || mappingMode != prevScopeMappingMode {
@@ -320,8 +384,6 @@ func (e *elasticsearchExporter) pushMetricsData(ctx context.Context, metrics pme
 		for _, dpGroup := range groupedDataPoints {
 			buf := e.bufferPool.NewPooledBuffer()
 			encoder := e.documentEncoders[int(key.mappingMode)]
-			session := sessions.StartSession(ctx, key.mappingMode)
-
 			dynamicTemplates, err := encoder.encodeMetrics(
 				encodingContext{
 					resource:          dpGroup.resource,
@@ -336,97 +398,89 @@ func (e *elasticsearchExporter) pushMetricsData(ctx context.Context, metrics pme
 			)
 			if err != nil {
 				buf.Recycle()
-				errs = append(errs, err)
+				perRecordErrs = append(perRecordErrs, err)
 				continue
 			}
-			if err := session.Add(ctx, key.index.Index, "", "", buf, dynamicTemplates, docappender.ActionCreate); err != nil {
-				// not recycling after Add returns an error as we don't know if it's already recycled
+			if err := sink.add(ctx, encodedItem{
+				index:            key.index.Index,
+				action:           docappender.ActionCreate,
+				dynamicTemplates: dynamicTemplates,
+				mappingMode:      key.mappingMode,
+				target:           targetDefault,
+			}, pooledDoc(buf)); err != nil {
 				if cerr := ctx.Err(); cerr != nil {
-					return cerr
+					return nil, cerr
 				}
-				errs = append(errs, err)
+				perRecordErrs = append(perRecordErrs, err)
 			}
 		}
 	}
 	if len(validationErrs) > 0 {
 		e.set.Logger.Warn("validation errors", zap.Error(errors.Join(validationErrs...)))
 	}
-
-	if err := sessions.Flush(ctx); err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return cerr
-		}
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+	return perRecordErrs, nil
 }
 
-func (e *elasticsearchExporter) pushTraceData(
-	ctx context.Context,
-	td ptrace.Traces,
-) error {
-	// Get the partioner key from the context
-	// Decode the key to get the info
+func (e *elasticsearchExporter) pushTraceData(ctx context.Context, td ptrace.Traces) error {
+	return pushStreaming(ctx, e, e.emitTraces, td)
+}
+
+func (e *elasticsearchExporter) encodeTraceRecords(ctx context.Context, td ptrace.Traces) ([]encodedItem, []error, error) {
+	// SpanCount is a lower bound (span events add more items) but a good hint.
+	return collectItems(ctx, e.emitTraces, td, td.SpanCount())
+}
+
+// emitTraces iterates td, encoding each span and its span events and handing each
+// to sink.
+func (e *elasticsearchExporter) emitTraces(ctx context.Context, sink docSink, td ptrace.Traces) ([]error, error) {
 	defaultMappingMode, err := e.getRequestMappingMode(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	sessions := mappingModeSessions{indexers: &e.bulkIndexers.modes}
-	defer sessions.End()
-
-	var errs []error
+	var perRecordErrs []error
 	for _, il := range td.ResourceSpans().All() {
 		resource := il.Resource()
 		for _, scopeSpan := range il.ScopeSpans().All() {
 			scope := scopeSpan.Scope()
 			mappingMode, err := e.getScopeMappingMode(scope, defaultMappingMode)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			session := sessions.StartSession(ctx, mappingMode)
 			router := e.documentRouters[int(mappingMode)]
 			spanEventRouter := e.spanEventDocumentRouters[int(mappingMode)]
 			encoder := e.documentEncoders[int(mappingMode)]
-
 			ec := encodingContext{
 				resource:          resource,
 				resourceSchemaURL: il.SchemaUrl(),
 				scope:             scope,
 				scopeSchemaURL:    scopeSpan.SchemaUrl(),
 			}
-
 			for _, span := range scopeSpan.Spans().All() {
-				if err := e.pushTraceRecord(ctx, router, encoder, ec, span, session); err != nil {
+				if err := e.emitSpan(ctx, sink, router, encoder, ec, span, mappingMode); err != nil {
 					if cerr := ctx.Err(); cerr != nil {
-						return cerr
+						return nil, cerr
 					}
-					errs = append(errs, err)
+					perRecordErrs = append(perRecordErrs, err)
 				}
 				for _, spanEvent := range span.Events().All() {
-					if err := e.pushSpanEvent(ctx, spanEventRouter, encoder, ec, span, spanEvent, session); err != nil {
-						errs = append(errs, err)
+					if err := e.emitSpanEvent(ctx, sink, spanEventRouter, encoder, ec, span, spanEvent, mappingMode); err != nil {
+						perRecordErrs = append(perRecordErrs, err)
 					}
 				}
 			}
 		}
 	}
-
-	if err := sessions.Flush(ctx); err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return cerr
-		}
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+	return perRecordErrs, nil
 }
 
-func (e *elasticsearchExporter) pushTraceRecord(
+func (e *elasticsearchExporter) emitSpan(
 	ctx context.Context,
+	sink docSink,
 	router documentRouter,
 	encoder documentEncoder,
 	ec encodingContext,
 	span ptrace.Span,
-	bulkIndexerSession bulkIndexerSession,
+	mappingMode MappingMode,
 ) error {
 	ctrl := extractControlAttrs(span.Attributes(), e.config.TracesDynamicID.Enabled, false)
 	if ctrl.noindex {
@@ -436,25 +490,29 @@ func (e *elasticsearchExporter) pushTraceRecord(
 	if err != nil {
 		return err
 	}
-
 	buf := e.bufferPool.NewPooledBuffer()
-	docID := ctrl.docID
 	if err := encoder.encodeSpan(ec, span, index, buf.Buffer); err != nil {
 		buf.Recycle()
 		return fmt.Errorf("failed to encode trace record: %w", err)
 	}
-	// not recycling after Add returns an error as we don't know if it's already recycled
-	return bulkIndexerSession.Add(ctx, index.Index, docID, "", buf, nil, docappender.ActionCreate)
+	return sink.add(ctx, encodedItem{
+		index:       index.Index,
+		docID:       ctrl.docID,
+		action:      docappender.ActionCreate,
+		mappingMode: mappingMode,
+		target:      targetDefault,
+	}, pooledDoc(buf))
 }
 
-func (e *elasticsearchExporter) pushSpanEvent(
+func (e *elasticsearchExporter) emitSpanEvent(
 	ctx context.Context,
+	sink docSink,
 	router documentRouter,
 	encoder documentEncoder,
 	ec encodingContext,
 	span ptrace.Span,
 	spanEvent ptrace.SpanEvent,
-	bulkIndexerSession bulkIndexerSession,
+	mappingMode MappingMode,
 ) error {
 	ctrl := extractControlAttrs(spanEvent.Attributes(), e.config.TracesDynamicID.Enabled, false)
 	if ctrl.noindex {
@@ -464,16 +522,19 @@ func (e *elasticsearchExporter) pushSpanEvent(
 	if err != nil {
 		return err
 	}
-
 	buf := e.bufferPool.NewPooledBuffer()
-	docID := ctrl.docID
 	index, err := encoder.encodeSpanEvent(ec, span, spanEvent, routerIndex, buf.Buffer)
 	if err != nil || buf.Buffer.Len() == 0 {
 		buf.Recycle()
 		return err
 	}
-	// not recycling after Add returns an error as we don't know if it's already recycled
-	return bulkIndexerSession.Add(ctx, index.Index, docID, "", buf, nil, docappender.ActionCreate)
+	return sink.add(ctx, encodedItem{
+		index:       index.Index,
+		docID:       ctrl.docID,
+		action:      docappender.ActionCreate,
+		mappingMode: mappingMode,
+		target:      targetDefault,
+	}, pooledDoc(buf))
 }
 
 // controlAttrs holds the values of control-channel attributes the orchestrator
@@ -532,42 +593,36 @@ func extractControlAttrs(attrs pcommon.Map, captureDocID, capturePipeline bool) 
 }
 
 func (e *elasticsearchExporter) pushProfilesData(ctx context.Context, pd pprofile.Profiles) error {
+	return pushStreaming(ctx, e, e.emitProfiles, pd)
+}
+
+func (e *elasticsearchExporter) encodeProfileRecords(ctx context.Context, pd pprofile.Profiles) ([]encodedItem, []error, error) {
+	// A profile fans out into a variable number of documents, so there is no
+	// cheap, accurate preallocation hint.
+	return collectItems(ctx, e.emitProfiles, pd, 0)
+}
+
+// emitProfiles iterates pd, encoding each profile. A single profile fans out into
+// multiple documents (stack traces, frames, events, executables, …), each routed
+// to its own bulk indexer via the item's sessionTarget; the encoder drives this
+// through the callback.
+func (e *elasticsearchExporter) emitProfiles(ctx context.Context, sink docSink, pd pprofile.Profiles) ([]error, error) {
 	// TODO add support for routing profiles to different data_stream.namespaces?
 	defaultMappingMode, err := e.getRequestMappingMode(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	var sessions sessionList
-	defer sessions.End()
-	startSession := func(indexer bulkIndexer) bulkIndexerSession {
-		session := indexer.StartSession(ctx)
-		sessions = append(sessions, session)
-		return session
-	}
-	eventsSession := startSession(e.bulkIndexers.profilingEvents)
-	stackTracesSession := startSession(e.bulkIndexers.profilingStackTraces)
-	stackFramesSession := startSession(e.bulkIndexers.profilingStackFrames)
-	executablesSession := startSession(e.bulkIndexers.profilingExecutables)
-
-	// scopeMappingModeSessions is used to create the default session according to
-	// the specified mapping mode.
-	scopeMappingModeSessions := mappingModeSessions{indexers: &e.bulkIndexers.modes}
-	defer scopeMappingModeSessions.End()
 	dic := pd.Dictionary()
-
-	var errs []error
+	var perRecordErrs []error
 	for _, rp := range pd.ResourceProfiles().All() {
 		resource := rp.Resource()
 		for _, sp := range rp.ScopeProfiles().All() {
 			scope := sp.Scope()
 			mappingMode, err := e.getScopeMappingMode(scope, defaultMappingMode)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			defaultSession := scopeMappingModeSessions.StartSession(ctx, mappingMode)
 			encoder := e.documentEncoders[int(mappingMode)]
-
 			for _, profile := range sp.Profiles().All() {
 				ec := encodingContext{
 					resource:          resource,
@@ -575,61 +630,54 @@ func (e *elasticsearchExporter) pushProfilesData(ctx context.Context, pd pprofil
 					scope:             scope,
 					scopeSchemaURL:    sp.SchemaUrl(),
 				}
-				if err := e.pushProfileRecord(
-					ctx, encoder, ec, dic, profile, defaultSession, eventsSession,
-					stackTracesSession, stackFramesSession, executablesSession,
-				); err != nil {
+				err := encoder.encodeProfile(ec, dic, profile, func(buf *bytes.Buffer, docID, index string) error {
+					target, action := profileIndexTarget(index)
+					return sink.add(ctx, encodedItem{
+						index:       index,
+						docID:       docID,
+						action:      action,
+						mappingMode: mappingMode,
+						target:      target,
+					}, rawDoc(buf))
+				})
+				if err != nil {
 					if cerr := ctx.Err(); cerr != nil {
-						return cerr
+						return nil, cerr
 					}
-
 					if errors.Is(err, ErrInvalidTypeForBodyMapMode) {
 						e.set.Logger.Warn("dropping profile record", zap.Error(err))
 						continue
 					}
-
-					errs = append(errs, err)
+					perRecordErrs = append(perRecordErrs, err)
 				}
 			}
 		}
 	}
-
-	if err := sessions.Flush(ctx); err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return cerr
-		}
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+	return perRecordErrs, nil
 }
 
-func (*elasticsearchExporter) pushProfileRecord(
-	ctx context.Context,
-	encoder documentEncoder,
-	ec encodingContext,
-	dic pprofile.ProfilesDictionary,
-	profile pprofile.Profile,
-	defaultSession, eventsSession, stackTracesSession, stackFramesSession, executablesSession bulkIndexerSession,
-) error {
-	return encoder.encodeProfile(ec, dic, profile, func(buf *bytes.Buffer, docID, index string) error {
-		switch index {
-		case otelserializer.StackTraceIndex:
-			return stackTracesSession.Add(ctx, index, docID, "", buf, nil, docappender.ActionCreate)
-		case otelserializer.StackFrameIndex:
-			return stackFramesSession.Add(ctx, index, docID, "", buf, nil, docappender.ActionCreate)
-		case otelserializer.AllEventsIndex:
-			return eventsSession.Add(ctx, index, docID, "", buf, nil, docappender.ActionCreate)
-		case otelserializer.ExecutablesIndex:
-			return executablesSession.Add(ctx, index, docID, "", buf, nil, docappender.ActionUpdate)
-		case otelserializer.ExecutablesSymQueueIndex,
-			otelserializer.LeafFramesSymQueueIndex,
-			otelserializer.HostsMetadataIndex:
-			// These regular indices have a low write-frequency and can share the executablesSession.
-			return executablesSession.Add(ctx, index, docID, "", buf, nil, docappender.ActionCreate)
-		default:
-			return defaultSession.Add(ctx, index, docID, "", buf, nil, docappender.ActionCreate)
-		}
-	})
+// profileIndexTarget maps a profiling document's target index to the bulk
+// indexer session it should be written to and the bulk action to use. It mirrors
+// the routing in pushProfileRecord.
+func profileIndexTarget(index string) (sessionTarget, string) {
+	switch index {
+	case otelserializer.StackTraceIndex:
+		return targetProfilingStackTraces, docappender.ActionCreate
+	case otelserializer.StackFrameIndex:
+		return targetProfilingStackFrames, docappender.ActionCreate
+	case otelserializer.AllEventsIndex:
+		return targetProfilingEvents, docappender.ActionCreate
+	case otelserializer.ExecutablesIndex:
+		return targetProfilingExecutables, docappender.ActionUpdate
+	case otelserializer.ExecutablesSymQueueIndex,
+		otelserializer.LeafFramesSymQueueIndex,
+		otelserializer.HostsMetadataIndex:
+		// These regular indices have a low write-frequency and can share the
+		// executables session.
+		return targetProfilingExecutables, docappender.ActionCreate
+	default:
+		return targetDefault, docappender.ActionCreate
+	}
 }
 
 // mappingModeSessions holds mapping-mode specific bulk indexer sessions.

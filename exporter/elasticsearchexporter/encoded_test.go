@@ -1,0 +1,1213 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package elasticsearchexporter
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/config/configcompression"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/exporter/exporterhelper/xexporterhelper"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.opentelemetry.io/collector/exporter/xexporter"
+	"go.opentelemetry.io/collector/extension/xextension/storage"
+	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/pprofile"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	pdatareq "go.opentelemetry.io/collector/pdata/xpdata/request"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/metadata"
+)
+
+// newPersistentQueueFallbackTest builds a config with a persistent sending queue
+// (sending_queue.storage) and the feature gate off, plus a bulk-recording server
+// and a host exposing the storage extension. In this mode every signal's exporter
+// must fall back to the legacy pdata-based request (which the persistent queue can
+// marshal to disk) instead of the ingest-time-encoding request path (whose custom
+// request type is not marshalable). Without the fallback the exporter would fail
+// to persist requests.
+func newPersistentQueueFallbackTest(t *testing.T) (*Config, component.Host, *bulkRecorder) {
+	rec := newBulkRecorder()
+	server := newESTestServer(t, func(docs []itemRequest) ([]itemResponse, error) {
+		rec.Record(docs)
+		return itemsAllOK(docs)
+	})
+
+	storageID := component.MustNewID("file_storage")
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoints = []string{server.URL}
+		cfg.Mapping.Mode = "otel"
+		cfg.QueueBatchConfig.Get().NumConsumers = 1
+		cfg.QueueBatchConfig.Get().Batch.Get().FlushTimeout = 10 * time.Millisecond
+		// Enable the persistent queue, which triggers the legacy pdata path.
+		cfg.QueueBatchConfig.Get().StorageID = &storageID
+	})
+
+	host := &storageTestHost{
+		ext: map[component.ID]component.Component{
+			storageID: newInMemoryStorageExtension(),
+		},
+	}
+	return cfg, host, rec
+}
+
+func TestCreateExporter_PersistentQueueFallback(t *testing.T) {
+	f := NewFactory()
+	set := exportertest.NewNopSettings(metadata.Type)
+
+	t.Run("logs", func(t *testing.T) {
+		cfg, host, rec := newPersistentQueueFallbackTest(t)
+		exp, err := f.CreateLogs(context.Background(), set, cfg)
+		require.NoError(t, err)
+		require.NoError(t, exp.Start(context.Background(), host))
+		t.Cleanup(func() { require.NoError(t, exp.Shutdown(context.Background())) })
+		require.NoError(t, exp.ConsumeLogs(context.Background(), benchLogs(3)))
+		rec.WaitItems(1)
+	})
+
+	t.Run("metrics", func(t *testing.T) {
+		cfg, host, rec := newPersistentQueueFallbackTest(t)
+		exp, err := f.CreateMetrics(context.Background(), set, cfg)
+		require.NoError(t, err)
+		require.NoError(t, exp.Start(context.Background(), host))
+		t.Cleanup(func() { require.NoError(t, exp.Shutdown(context.Background())) })
+		require.NoError(t, exp.ConsumeMetrics(context.Background(), benchMetrics(3)))
+		rec.WaitItems(1)
+	})
+
+	t.Run("traces", func(t *testing.T) {
+		cfg, host, rec := newPersistentQueueFallbackTest(t)
+		exp, err := f.CreateTraces(context.Background(), set, cfg)
+		require.NoError(t, err)
+		require.NoError(t, exp.Start(context.Background(), host))
+		t.Cleanup(func() { require.NoError(t, exp.Shutdown(context.Background())) })
+		require.NoError(t, exp.ConsumeTraces(context.Background(), benchTraces(3)))
+		rec.WaitItems(1)
+	})
+
+	t.Run("profiles", func(t *testing.T) {
+		cfg, host, rec := newPersistentQueueFallbackTest(t)
+		exp, err := f.(xexporter.Factory).CreateProfiles(context.Background(), set, cfg)
+		require.NoError(t, err)
+		require.NoError(t, exp.Start(context.Background(), host))
+		t.Cleanup(func() { require.NoError(t, exp.Shutdown(context.Background())) })
+		require.NoError(t, exp.ConsumeProfiles(context.Background(), benchProfiles(1)))
+		rec.WaitItems(1)
+	})
+}
+
+// storageTestHost is a component.Host that exposes a set of extensions, used to
+// satisfy the persistent queue's lookup of the configured storage extension.
+type storageTestHost struct {
+	ext map[component.ID]component.Component
+}
+
+func (h *storageTestHost) GetExtensions() map[component.ID]component.Component {
+	return h.ext
+}
+
+// inMemoryStorageExtension is a minimal storage.Extension backed by an in-memory
+// map. It is sufficient to exercise the persistent-queue code paths in tests
+// without touching disk.
+type inMemoryStorageExtension struct {
+	component.StartFunc
+	component.ShutdownFunc
+}
+
+func newInMemoryStorageExtension() *inMemoryStorageExtension {
+	return &inMemoryStorageExtension{}
+}
+
+func (*inMemoryStorageExtension) GetClient(context.Context, component.Kind, component.ID, string) (storage.Client, error) {
+	return &inMemoryStorageClient{data: make(map[string][]byte)}, nil
+}
+
+type inMemoryStorageClient struct {
+	mu   sync.Mutex
+	data map[string][]byte
+}
+
+func (c *inMemoryStorageClient) Get(_ context.Context, key string) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.data[key], nil
+}
+
+func (c *inMemoryStorageClient) Set(_ context.Context, key string, value []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.data[key] = value
+	return nil
+}
+
+func (c *inMemoryStorageClient) Delete(_ context.Context, key string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.data, key)
+	return nil
+}
+
+func (c *inMemoryStorageClient) Batch(_ context.Context, ops ...*storage.Operation) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, op := range ops {
+		switch op.Type {
+		case storage.Get:
+			op.Value = c.data[op.Key]
+		case storage.Set:
+			c.data[op.Key] = op.Value
+		case storage.Delete:
+			delete(c.data, op.Key)
+		}
+	}
+	return nil
+}
+
+func (*inMemoryStorageClient) Close(context.Context) error { return nil }
+
+var (
+	_ storage.Extension = (*inMemoryStorageExtension)(nil)
+	_ storage.Client    = (*inMemoryStorageClient)(nil)
+	_ component.Host    = (*storageTestHost)(nil)
+)
+
+// makeItems builds a slice of encodedItem whose docs have the given byte
+// sizes. Each doc is filled with a distinct marker so tests can assert that no
+// item is lost or duplicated across a split.
+func makeItems(sizes ...int) []encodedItem {
+	items := make([]encodedItem, len(sizes))
+	for i, size := range sizes {
+		doc := bytes.Repeat([]byte{byte('a' + i%26)}, size)
+		items[i] = encodedItem{
+			index:       fmt.Sprintf("idx-%d", i),
+			doc:         doc,
+			mappingMode: MappingOTel,
+		}
+	}
+	return items
+}
+
+// itemKeys returns the index field of every item across all requests, used to
+// assert that a split preserves exactly the input set (ignoring ordering).
+func itemKeys(reqs []xexporterhelper.Request) []string {
+	var keys []string
+	for _, req := range reqs {
+		for _, item := range req.(*encodedRequest).items {
+			keys = append(keys, item.index)
+		}
+	}
+	return keys
+}
+
+func TestEncodedLogsRequest_ItemsCountAndBytesSize(t *testing.T) {
+	req := newEncodedRequest(makeItems(3, 5, 2))
+	require.Equal(t, 3, req.ItemsCount())
+	require.Equal(t, 10, req.BytesSize())
+
+	empty := newEncodedRequest(nil)
+	require.Equal(t, 0, empty.ItemsCount())
+	require.Equal(t, 0, empty.BytesSize())
+}
+
+func TestEncodedLogsRequest_MergeSplit(t *testing.T) {
+	t.Run("merge with nil, no split", func(t *testing.T) {
+		r := newEncodedRequest(makeItems(1, 2))
+		out, err := r.MergeSplit(context.Background(), 0, exporterhelper.RequestSizerTypeBytes, nil)
+		require.NoError(t, err)
+		require.Len(t, out, 1)
+		require.Equal(t, 2, out[0].ItemsCount())
+	})
+
+	t.Run("merge with other request", func(t *testing.T) {
+		r := newEncodedRequest(makeItems(1, 2))
+		other := newEncodedRequest(makeItems(3))
+		out, err := r.MergeSplit(context.Background(), 0, exporterhelper.RequestSizerTypeBytes, other)
+		require.NoError(t, err)
+		require.Len(t, out, 1)
+		require.Equal(t, 3, out[0].ItemsCount())
+	})
+
+	t.Run("incompatible request type", func(t *testing.T) {
+		r := newEncodedRequest(makeItems(1))
+		_, err := r.MergeSplit(context.Background(), 0, exporterhelper.RequestSizerTypeBytes, stubRequest{})
+		require.ErrorContains(t, err, "incompatible Request type")
+	})
+
+	t.Run("sizer requests keeps single request", func(t *testing.T) {
+		r := newEncodedRequest(makeItems(1, 1, 1))
+		out, err := r.MergeSplit(context.Background(), 2, exporterhelper.RequestSizerTypeRequests, nil)
+		require.NoError(t, err)
+		require.Len(t, out, 1)
+		require.Equal(t, 3, out[0].ItemsCount())
+	})
+
+	t.Run("sizer bytes splits", func(t *testing.T) {
+		r := newEncodedRequest(makeItems(3, 3, 3))
+		out, err := r.MergeSplit(context.Background(), 6, exporterhelper.RequestSizerTypeBytes, nil)
+		require.NoError(t, err)
+		require.Len(t, out, 2)
+		require.ElementsMatch(t, []string{"idx-0", "idx-1", "idx-2"}, itemKeys(out))
+	})
+
+	t.Run("sizer items splits", func(t *testing.T) {
+		r := newEncodedRequest(makeItems(1, 1, 1, 1, 1))
+		out, err := r.MergeSplit(context.Background(), 2, exporterhelper.RequestSizerTypeItems, nil)
+		require.NoError(t, err)
+		require.Len(t, out, 3)
+		require.Equal(t, 2, out[0].ItemsCount())
+		require.Equal(t, 2, out[1].ItemsCount())
+		require.Equal(t, 1, out[2].ItemsCount())
+	})
+
+	t.Run("empty merged result", func(t *testing.T) {
+		r := newEncodedRequest(nil)
+		out, err := r.MergeSplit(context.Background(), 10, exporterhelper.RequestSizerTypeBytes, nil)
+		require.NoError(t, err)
+		require.Len(t, out, 1)
+		require.Equal(t, 0, out[0].ItemsCount())
+	})
+
+	t.Run("unsupported sizer type", func(t *testing.T) {
+		r := newEncodedRequest(makeItems(1))
+		_, err := r.MergeSplit(context.Background(), 10, exporterhelper.RequestSizerType{}, nil)
+		require.ErrorContains(t, err, "unsupported sizer type")
+	})
+}
+
+func TestSplitLogsByBytes(t *testing.T) {
+	tests := []struct {
+		name      string
+		sizes     []int
+		maxSize   int
+		wantReqs  int
+		wantItems int
+	}{
+		{name: "all fit in one bin", sizes: []int{1, 1, 1}, maxSize: 100, wantReqs: 1, wantItems: 3},
+		{name: "greedy binning", sizes: []int{3, 3, 3}, maxSize: 6, wantReqs: 2, wantItems: 3},
+		{name: "oversized item at start", sizes: []int{10, 2}, maxSize: 5, wantReqs: 2, wantItems: 2},
+		{name: "oversized item in middle", sizes: []int{2, 10, 2}, maxSize: 5, wantReqs: 3, wantItems: 3},
+		{name: "oversized triggers min swap", sizes: []int{1, 6, 2}, maxSize: 5, wantReqs: 3, wantItems: 3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out := splitByBytes(makeItems(tc.sizes...), tc.maxSize)
+			require.Len(t, out, tc.wantReqs)
+
+			// Every input item appears exactly once across the output.
+			var gotItems int
+			for _, req := range out {
+				gotItems += req.ItemsCount()
+			}
+			require.Equal(t, tc.wantItems, gotItems)
+
+			// Interface contract: the last request must be the smallest.
+			last := out[len(out)-1].BytesSize()
+			for _, req := range out {
+				require.LessOrEqual(t, last, req.BytesSize())
+			}
+		})
+	}
+}
+
+func TestSplitLogsByCount(t *testing.T) {
+	t.Run("non-positive maxCount keeps single request", func(t *testing.T) {
+		out := splitByCount(makeItems(1, 1, 1), 0)
+		require.Len(t, out, 1)
+		require.Equal(t, 3, out[0].ItemsCount())
+	})
+	t.Run("exact multiple", func(t *testing.T) {
+		out := splitByCount(makeItems(1, 1, 1, 1), 2)
+		require.Len(t, out, 2)
+		require.Equal(t, 2, out[0].ItemsCount())
+		require.Equal(t, 2, out[1].ItemsCount())
+	})
+	t.Run("with remainder", func(t *testing.T) {
+		out := splitByCount(makeItems(1, 1, 1, 1, 1), 2)
+		require.Len(t, out, 3)
+		require.Equal(t, 1, out[2].ItemsCount())
+		require.ElementsMatch(t,
+			[]string{"idx-0", "idx-1", "idx-2", "idx-3", "idx-4"}, itemKeys(out))
+	})
+}
+
+// TestSplitDoesNotAliasSiblings guards against the split functions returning
+// sub-requests that share a backing array such that a later MergeSplit append on
+// the retained (last) request overwrites already-emitted sibling requests. The
+// batcher keeps one split result as its pending batch and flushes the others
+// concurrently, then merges new data into the retained one, so aliasing here
+// corrupts in-flight requests and races the flush goroutines.
+func TestSplitDoesNotAliasSiblings(t *testing.T) {
+	check := func(t *testing.T, out []xexporterhelper.Request) {
+		require.GreaterOrEqual(t, len(out), 2)
+		siblings := out[:len(out)-1]
+		before := itemKeys(siblings)
+
+		// Merge new items into the retained (last) request, as the batcher does.
+		_, err := out[len(out)-1].MergeSplit(context.Background(), 0, exporterhelper.RequestSizerTypeBytes,
+			newEncodedRequest([]encodedItem{
+				{index: "NEW-X", doc: []byte("x")},
+				{index: "NEW-Y", doc: []byte("y")},
+			}))
+		require.NoError(t, err)
+
+		// The already-emitted siblings must be untouched.
+		require.Equal(t, before, itemKeys(siblings), "MergeSplit corrupted sibling requests via shared backing array")
+	}
+
+	t.Run("splitByBytes with min-swap", func(t *testing.T) {
+		// sizes {1,6,2}/max 5 emits 3 requests and min-swaps the smallest to the
+		// end, so the retained request is a non-tail subslice of the array.
+		check(t, splitByBytes(makeItems(1, 6, 2), 5))
+	})
+	t.Run("splitByCount", func(t *testing.T) {
+		check(t, splitByCount(makeItems(1, 1, 1, 1, 1), 2))
+	})
+}
+
+func TestNewLogsRequestConverter_PerRecordErrorsAreReturned(t *testing.T) {
+	// An invalid Logstash date format makes routing fail for every record. The
+	// converter must surface those deterministic per-record errors to the caller
+	// rather than dropping the records silently, and produce no request.
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoints = []string{"http://localhost:9200"}
+		cfg.Mapping.Mode = "otel"
+		cfg.LogstashFormat = LogstashFormatSettings{
+			Enabled:         true,
+			PrefixSeparator: "-",
+			DateFormat:      "%q", // invalid strftime directive
+		}
+	})
+	exp, err := newExporter(cfg, exportertest.NewNopSettings(metadata.Type), cfg.LogsIndex)
+	require.NoError(t, err)
+
+	req, err := newEncodedConverter(exp, exp.encodeLogRecords)(context.Background(), benchLogs(3))
+	require.Error(t, err)
+	require.Nil(t, req)
+}
+
+func TestPushLogsRequest_WrongType(t *testing.T) {
+	e := &elasticsearchExporter{}
+	err := e.pushEncodedRequest(context.Background(), stubRequest{})
+	require.ErrorContains(t, err, "expected *encodedRequest")
+}
+
+// TestConsumeEncodedItems_RoutesToAllTargets verifies that consumeEncodedItems
+// starts and flushes a session for every session target (the mapping-mode
+// indexer plus each profiling indexer), exercising the profiling fan-out used by
+// early-encoded profiles.
+func TestConsumeEncodedItems_RoutesToAllTargets(t *testing.T) {
+	var flushed atomic.Int64
+	server := newBenchESServer(t, &flushed)
+	exp := newBenchLogsExporter(t, server.URL)
+
+	items := []encodedItem{
+		{index: "logs-generic", action: "create", mappingMode: MappingOTel, target: targetDefault, doc: []byte(`{"a":1}`)},
+		{index: "profiling-events-all", action: "create", target: targetProfilingEvents, doc: []byte(`{"a":1}`)},
+		{index: "profiling-stacktraces", action: "create", target: targetProfilingStackTraces, doc: []byte(`{"a":1}`)},
+		{index: "profiling-stackframes", action: "create", target: targetProfilingStackFrames, doc: []byte(`{"a":1}`)},
+		{index: "profiling-executables", action: "update", target: targetProfilingExecutables, doc: []byte(`{"a":1}`)},
+	}
+
+	require.NoError(t, exp.consumeEncodedItems(context.Background(), items))
+	require.Equal(t, int64(len(items)), flushed.Load())
+}
+
+func TestPushLogsRequest_ContextCancelled(t *testing.T) {
+	server := newBenchESServer(t, nil)
+	exp := newBenchLogsExporter(t, server.URL)
+
+	req, err := newEncodedConverter(exp, exp.encodeLogRecords)(context.Background(), benchLogs(5))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// With the context already cancelled the flush cannot complete; the
+	// consumer must surface the context error rather than a bulk error.
+	err = exp.pushEncodedRequest(ctx, req)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+// stubRequest is a minimal xexporterhelper.Request used to exercise the
+// wrong-type branches; its methods are never meaningfully called.
+type stubRequest struct{}
+
+func (stubRequest) ItemsCount() int { return 0 }
+func (stubRequest) BytesSize() int  { return 0 }
+func (stubRequest) MergeSplit(context.Context, int, exporterhelper.RequestSizerType, xexporterhelper.Request) ([]xexporterhelper.Request, error) {
+	return nil, nil
+}
+
+var _ xexporterhelper.Request = stubRequest{}
+
+// newBenchESServer returns an httptest server that speaks just enough of the
+// Elasticsearch bulk protocol for the exporter to flush successfully, echoing a
+// success status for every document. It is used by the benchmarks to avoid a
+// real Elasticsearch dependency while still exercising the flush path. When
+// flushed is non-nil it is incremented by the number of documents in each bulk
+// request, so throughput benchmarks can wait for the queue to fully drain.
+func newBenchESServer(tb testing.TB, flushed *atomic.Int64) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Add("X-Elastic-Product", "Elasticsearch")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"version": map[string]any{"number": currentESVersion},
+		})
+	})
+	mux.HandleFunc("/_bulk", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("X-Elastic-Product", "Elasticsearch")
+		body := r.Body
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			gr, err := gzip.NewReader(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			body = gr
+		}
+		// Each bulk item is an action line followed by a document line.
+		var lines int
+		dec := json.NewDecoder(body)
+		for dec.More() {
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			lines++
+		}
+		items := lines / 2
+		if flushed != nil {
+			flushed.Add(int64(items))
+		}
+
+		var buf bytes.Buffer
+		buf.WriteString(`{"took":1,"errors":false,"items":[`)
+		for i := range items {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			buf.WriteString(`{"create":{"status":200}}`)
+		}
+		buf.WriteString(`]}`)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(buf.Bytes())
+	})
+	server := httptest.NewServer(mux)
+	tb.Cleanup(server.Close)
+	return server
+}
+
+func newBenchLogsExporter(tb testing.TB, url string) *elasticsearchExporter {
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoints = []string{url}
+		cfg.Mapping.Mode = "otel"
+	})
+	exp, err := newExporter(cfg, exportertest.NewNopSettings(metadata.Type), cfg.LogsIndex)
+	require.NoError(tb, err)
+	require.NoError(tb, exp.Start(context.Background(), componenttest.NewNopHost()))
+	tb.Cleanup(func() { require.NoError(tb, exp.Shutdown(context.Background())) })
+	return exp
+}
+
+// benchLogs builds a plog.Logs with nRecords log records under a single
+// resource/scope, each carrying a realistic body, timestamps, severity and a
+// few attributes so the JSON encoding cost is representative.
+func benchLogs(nRecords int) plog.Logs {
+	logs := plog.NewLogs()
+	rl := logs.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("service.name", "benchmark-service")
+	rl.Resource().Attributes().PutStr("host.name", "benchmark-host-01")
+	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName("benchmark-scope")
+	ts := pcommon.NewTimestampFromTime(time.Unix(1700000000, 0))
+	for i := range nRecords {
+		lr := sl.LogRecords().AppendEmpty()
+		lr.SetTimestamp(ts)
+		lr.SetObservedTimestamp(ts)
+		lr.SetSeverityNumber(plog.SeverityNumberInfo)
+		lr.SetSeverityText("INFO")
+		lr.Body().SetStr("this is a representative log message with some detail")
+		lr.Attributes().PutStr("http.method", "GET")
+		lr.Attributes().PutStr("http.target", fmt.Sprintf("/api/v1/resource/%d", i))
+		lr.Attributes().PutInt("http.status_code", 200)
+	}
+	logs.MarkReadOnly()
+	return logs
+}
+
+// benchMetrics builds a pmetric.Metrics with nRecords gauge data points, each at
+// a distinct timestamp so it becomes its own document group.
+func benchMetrics(nRecords int) pmetric.Metrics {
+	metrics := pmetric.NewMetrics()
+	rm := metrics.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "benchmark-service")
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("benchmark-scope")
+	for i := range nRecords {
+		m := sm.Metrics().AppendEmpty()
+		m.SetName(fmt.Sprintf("metric.gauge.%d", i))
+		dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(int64(1700000000+i), 0)))
+		dp.SetIntValue(int64(i))
+	}
+	metrics.MarkReadOnly()
+	return metrics
+}
+
+// benchTraces builds a ptrace.Traces with nRecords spans under a single
+// resource/scope.
+func benchTraces(nRecords int) ptrace.Traces {
+	traces := ptrace.NewTraces()
+	rs := traces.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("service.name", "benchmark-service")
+	ss := rs.ScopeSpans().AppendEmpty()
+	ss.Scope().SetName("benchmark-scope")
+	ts := pcommon.NewTimestampFromTime(time.Unix(1700000000, 0))
+	for i := range nRecords {
+		span := ss.Spans().AppendEmpty()
+		span.SetName(fmt.Sprintf("span.%d", i))
+		span.SetTraceID([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+		span.SetSpanID([8]byte{1, 2, 3, 4, 5, 6, 7, byte(i)})
+		span.SetStartTimestamp(ts)
+		span.SetEndTimestamp(ts)
+	}
+	traces.MarkReadOnly()
+	return traces
+}
+
+// benchProfiles builds a pprofile.Profiles with nProfiles minimal-but-valid
+// profiles sharing one dictionary. Profiles only support the otel mapping mode
+// and fan out across the profiling indices, so each profile produces more than
+// one bulk document.
+func benchProfiles(nProfiles int) pprofile.Profiles {
+	profiles := pprofile.NewProfiles()
+	dic := profiles.Dictionary()
+
+	dic.StringTable().Append("samples", "count", "cpu", "nanoseconds")
+	a := dic.AttributeTable().AppendEmpty()
+	a.SetKeyStrindex(4)
+	dic.StringTable().Append("process.executable.build_id.htlhash")
+	a.Value().SetStr("600DCAFE4A110000F2BF38C493F5FB92")
+	a = dic.AttributeTable().AppendEmpty()
+	a.SetKeyStrindex(5)
+	dic.StringTable().Append("profile.frame.type")
+	a.Value().SetStr("native")
+	a = dic.AttributeTable().AppendEmpty()
+	a.SetKeyStrindex(6)
+	dic.StringTable().Append("host.id")
+	a.Value().SetStr("localhost")
+	dic.StackTable().AppendEmpty().LocationIndices().Append(0)
+	dic.MappingTable().AppendEmpty().AttributeIndices().Append(0)
+	l := dic.LocationTable().AppendEmpty()
+	l.SetMappingIndex(0)
+	l.SetAddress(111)
+	l.AttributeIndices().Append(1)
+
+	sp := profiles.ResourceProfiles().AppendEmpty().ScopeProfiles().AppendEmpty()
+	for range nProfiles {
+		profile := sp.Profiles().AppendEmpty()
+		profile.SampleType().SetTypeStrindex(0)
+		profile.SampleType().SetUnitStrindex(1)
+		profile.PeriodType().SetTypeStrindex(2)
+		profile.PeriodType().SetUnitStrindex(3)
+		profile.AttributeIndices().Append(2)
+		profile.Samples().AppendEmpty().TimestampsUnixNano().Append(0)
+	}
+	return profiles
+}
+
+// startBenchExporter builds and starts an *elasticsearchExporter over url in the
+// otel mapping mode, using indexOf to pick the signal's default index.
+func startBenchExporter(tb testing.TB, url string, indexOf func(*Config) string) *elasticsearchExporter {
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoints = []string{url}
+		cfg.Mapping.Mode = "otel"
+	})
+	exp, err := newExporter(cfg, exportertest.NewNopSettings(metadata.Type), indexOf(cfg))
+	require.NoError(tb, err)
+	require.NoError(tb, exp.Start(context.Background(), componenttest.NewNopHost()))
+	tb.Cleanup(func() { require.NoError(tb, exp.Shutdown(context.Background())) })
+	return exp
+}
+
+// benchmarkSignalExporter runs the three per-signal comparison sub-benchmarks so
+// every signal is measured identically:
+//
+//   - consumer_legacy_encode_and_send: the legacy path, which encodes each record
+//     and sends it on the sending-queue consumer goroutine.
+//   - consumer_request_send_only: the request path's consumer, which only sends
+//     already-encoded bytes (the critical path early encoding aims to speed up).
+//   - ingest_encode: the per-record encoding relocated to the ConsumeX caller.
+//
+// The honest total cost of the request path is ingest_encode + send_only.
+func benchmarkSignalExporter[T any](
+	b *testing.B,
+	exp *elasticsearchExporter,
+	data T,
+	pushLegacy func(context.Context, T) error,
+	encode recordEncoder[T],
+) {
+	ctx := context.Background()
+	converter := newEncodedConverter(exp, encode)
+	preEncoded, err := converter(ctx, data)
+	require.NoError(b, err)
+
+	b.Run("consumer_legacy_encode_and_send", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if err := pushLegacy(ctx, data); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("consumer_request_send_only", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if err := exp.pushEncodedRequest(ctx, preEncoded); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("ingest_encode", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := converter(ctx, data); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// BenchmarkLogsExporter compares the two logs code paths. The key result is that
+// the sending-queue consumer's critical path is much cheaper in the request
+// path (consumer_request_send_only) than in the legacy path
+// (consumer_legacy_encode_and_send), because per-record JSON serialization has
+// been moved to ingest time (ingest_encode), which runs on the ConsumeLogs
+// caller goroutines instead of the consumer goroutine.
+func BenchmarkLogsExporter(b *testing.B) {
+	exp := startBenchExporter(b, newBenchESServer(b, nil).URL, func(c *Config) string { return c.LogsIndex })
+	for _, n := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("records=%d", n), func(b *testing.B) {
+			benchmarkSignalExporter(b, exp, benchLogs(n), exp.pushLogsData, exp.encodeLogRecords)
+		})
+	}
+}
+
+// BenchmarkMetricsExporter, BenchmarkTracesExporter and BenchmarkProfilesExporter
+// run the identical comparison for the other signals, confirming the generic
+// early-encoding path behaves like the logs path across signal types.
+func BenchmarkMetricsExporter(b *testing.B) {
+	exp := startBenchExporter(b, newBenchESServer(b, nil).URL, func(c *Config) string { return c.MetricsIndex })
+	for _, n := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("records=%d", n), func(b *testing.B) {
+			benchmarkSignalExporter(b, exp, benchMetrics(n), exp.pushMetricsData, exp.encodeMetricRecords)
+		})
+	}
+}
+
+func BenchmarkTracesExporter(b *testing.B) {
+	exp := startBenchExporter(b, newBenchESServer(b, nil).URL, func(c *Config) string { return c.TracesIndex })
+	for _, n := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("records=%d", n), func(b *testing.B) {
+			benchmarkSignalExporter(b, exp, benchTraces(n), exp.pushTraceData, exp.encodeTraceRecords)
+		})
+	}
+}
+
+func BenchmarkProfilesExporter(b *testing.B) {
+	exp := startBenchExporter(b, newBenchESServer(b, nil).URL, func(*Config) string { return "" })
+	for _, n := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("profiles=%d", n), func(b *testing.B) {
+			benchmarkSignalExporter(b, exp, benchProfiles(n), exp.pushProfilesData, exp.encodeProfileRecords)
+		})
+	}
+}
+
+// BenchmarkQueuedMemory quantifies the steady-state heap retained per queued
+// request, the main memory trade-off of early encoding. It builds many requests,
+// holds them all, and reports the heap growth per request measured after a GC:
+//
+//   - early_encoded_request holds an encodedRequest: the encoded ES JSON for
+//     every record plus per-item metadata. This is what an in-memory queue keeps.
+//   - early_marshaled_bytes holds the encodedRequest marshaled to its wire
+//     format, what a persistent queue writes to disk.
+//   - legacy_pdata holds the live plog.Logs object graph, what the legacy
+//     in-memory queue keeps.
+//   - legacy_pdata_proto_bytes holds the marshaled protobuf, what the legacy
+//     persistent queue writes.
+//
+// Run with a fixed, modest -benchtime (e.g. -benchtime=200x) to bound total
+// retention. The reported ns/op is dominated by build cost and is not meaningful;
+// read retained_B/req.
+func BenchmarkQueuedMemory(b *testing.B) {
+	const nRecords = 1000
+	exp := startBenchExporter(b, newBenchESServer(b, nil).URL, func(c *Config) string { return c.LogsIndex })
+	ctx := context.Background()
+	converter := newEncodedConverter(exp, exp.encodeLogRecords)
+	encoding := encodedEncoding[plog.Logs]{convert: converter}
+	protoMarshaler := &plog.ProtoMarshaler{}
+
+	retained := func(b *testing.B, build func() any) {
+		held := make([]any, 0, b.N)
+		runtime.GC()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+		for b.Loop() {
+			held = append(held, build())
+		}
+		runtime.GC()
+		var after runtime.MemStats
+		runtime.ReadMemStats(&after)
+		b.ReportMetric(float64(after.HeapAlloc-before.HeapAlloc)/float64(len(held)), "retained_B/req")
+		runtime.KeepAlive(held)
+	}
+
+	b.Run("early_encoded_request", func(b *testing.B) {
+		retained(b, func() any {
+			req, err := converter(ctx, benchLogs(nRecords))
+			if err != nil {
+				b.Fatal(err)
+			}
+			return req
+		})
+	})
+
+	b.Run("early_marshaled_bytes", func(b *testing.B) {
+		retained(b, func() any {
+			req, err := converter(ctx, benchLogs(nRecords))
+			if err != nil {
+				b.Fatal(err)
+			}
+			data, err := encoding.Marshal(ctx, req)
+			if err != nil {
+				b.Fatal(err)
+			}
+			return data
+		})
+	})
+
+	b.Run("legacy_pdata", func(b *testing.B) {
+		retained(b, func() any { return benchLogs(nRecords) })
+	})
+
+	b.Run("legacy_pdata_proto_bytes", func(b *testing.B) {
+		retained(b, func() any {
+			data, err := protoMarshaler.MarshalLogs(benchLogs(nRecords))
+			if err != nil {
+				b.Fatal(err)
+			}
+			return data
+		})
+	})
+}
+
+// newConcurrentLogsExporter builds a fully wired logs exporter for either the
+// legacy plog path (encoding on the sending-queue consumer goroutines) or the
+// request path (encoding at ingest, on the ConsumeLogs caller goroutines). To
+// make the placement of the encoding work the dominant factor, batching is
+// disabled, compression is turned off (so the consumer's flush is cheap I/O
+// rather than CPU-bound gzip), and the number of queue consumers is bounded.
+func newConcurrentLogsExporter(tb testing.TB, requestPath bool, url string, numConsumers int) exporter.Logs {
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoints = []string{url}
+		cfg.Mapping.Mode = "otel"
+		cfg.ClientConfig.Compression = configcompression.Type("") // no compression
+		qc := cfg.QueueBatchConfig.Get()
+		qc.NumConsumers = numConsumers
+		qc.QueueSize = 20000
+		qc.Sizer = exporterhelper.RequestSizerTypeRequests
+		qc.BlockOnOverflow = true
+		qc.Batch = configoptional.None[exporterhelper.BatchConfig]()
+	})
+	set := exportertest.NewNopSettings(metadata.Type)
+	esExp, err := newExporter(cfg, set, cfg.LogsIndex)
+	require.NoError(tb, err)
+
+	var logsExp exporter.Logs
+	if requestPath {
+		logsExp, err = xexporterhelper.NewLogsRequest(
+			context.Background(), set,
+			newEncodedConverter(esExp, esExp.encodeLogRecords), esExp.pushEncodedRequest,
+			exporterhelperOptions(cfg, esExp.Start, esExp.Shutdown, xexporterhelper.QueueBatchSettings{})...,
+		)
+	} else {
+		logsExp, err = exporterhelper.NewLogs(
+			context.Background(), set, cfg, esExp.pushLogsData,
+			exporterhelperOptions(cfg, esExp.Start, esExp.Shutdown, xexporterhelper.NewLogsQueueBatchSettings())...,
+		)
+	}
+	require.NoError(tb, err)
+	require.NoError(tb, logsExp.Start(context.Background(), componenttest.NewNopHost()))
+	tb.Cleanup(func() { require.NoError(tb, logsExp.Shutdown(context.Background())) })
+	return logsExp
+}
+
+// BenchmarkLogsExporterThroughput measures end-to-end throughput (logs/s) with
+// many concurrent ConsumeLogs callers feeding a small pool of queue consumers.
+// The request path encodes each batch on the (many) caller goroutines before
+// enqueueing, so encoding scales with ingest concurrency. The legacy path defers
+// encoding to the (few) consumer goroutines, making them the bottleneck. The
+// "logs/s" metric reported for request_encode_on_ingest should exceed the one
+// for legacy_encode_on_consumer.
+func BenchmarkLogsExporterThroughput(b *testing.B) {
+	const (
+		recordsPerCall = 100
+		numConsumers   = 2
+	)
+	ctx := context.Background()
+	logs := benchLogs(recordsPerCall)
+
+	for _, tc := range []struct {
+		name        string
+		requestPath bool
+	}{
+		{name: "legacy_encode_on_consumer", requestPath: false},
+		{name: "request_encode_on_ingest", requestPath: true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			var flushed atomic.Int64
+			server := newBenchESServer(b, &flushed)
+			exp := newConcurrentLogsExporter(b, tc.requestPath, server.URL, numConsumers)
+
+			producers := runtime.GOMAXPROCS(0)
+			target := int64(b.N) * recordsPerCall
+
+			b.ResetTimer()
+
+			var next atomic.Int64
+			var wg sync.WaitGroup
+			for range producers {
+				wg.Go(func() {
+					for next.Add(1) <= int64(b.N) {
+						if err := exp.ConsumeLogs(ctx, logs); err != nil {
+							b.Error(err)
+							return
+						}
+					}
+				})
+			}
+			wg.Wait()
+			// Wait until every enqueued record has actually been flushed so the
+			// measurement covers the full ingest-to-send pipeline, not just the
+			// enqueue.
+			for flushed.Load() < target {
+				runtime.Gosched()
+			}
+
+			b.StopTimer()
+			b.ReportMetric(float64(target)/b.Elapsed().Seconds(), "logs/s")
+		})
+	}
+}
+
+// BenchmarkLogsBytesSize compares the cost of the byte sizer's per-request size
+// measurement in the two paths. The default configuration batches by bytes, so
+// the queue/batcher calls Request.BytesSize() repeatedly.
+//
+//   - legacy_proto_size mirrors the built-in plog logsRequest.BytesSize(), which
+//     recomputes the protobuf-encoded size of the pdata on every call.
+//   - request_precomputed_size is encodedRequest.BytesSize(), which returns
+//     the sum of the already-encoded document lengths computed once at ingest.
+//
+// The request path turns an O(records) proto traversal into an O(1) field read,
+// and the reported size is the real encoded payload size rather than the proto
+// size.
+func BenchmarkLogsBytesSize(b *testing.B) {
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoints = []string{"http://localhost:9200"}
+		cfg.Mapping.Mode = "otel"
+	})
+	exp, err := newExporter(cfg, exportertest.NewNopSettings(metadata.Type), cfg.LogsIndex)
+	require.NoError(b, err)
+	converter := newEncodedConverter(exp, exp.encodeLogRecords)
+	marshaler := &plog.ProtoMarshaler{}
+
+	for _, nRecords := range []int{100, 1000} {
+		logs := benchLogs(nRecords)
+		req, err := converter(context.Background(), logs)
+		require.NoError(b, err)
+
+		b.Run(fmt.Sprintf("records=%d/legacy_proto_size", nRecords), func(b *testing.B) {
+			b.ReportAllocs()
+			var sink int
+			for b.Loop() {
+				sink = marshaler.LogsSize(logs)
+			}
+			runtime.KeepAlive(sink)
+		})
+
+		b.Run(fmt.Sprintf("records=%d/request_precomputed_size", nRecords), func(b *testing.B) {
+			b.ReportAllocs()
+			var sink int
+			for b.Loop() {
+				sink = req.BytesSize()
+			}
+			runtime.KeepAlive(sink)
+		})
+	}
+}
+
+func TestLogsUseEarlyEncoding(t *testing.T) {
+	storageID := component.MustNewID("file_storage")
+	withStorage := func(cfg *Config) { cfg.QueueBatchConfig.Get().StorageID = &storageID }
+	withMetadataKeys := func(cfg *Config) { cfg.MetadataKeys = []string{"x-tenant"} }
+
+	tests := []struct {
+		name      string
+		gateOn    bool
+		mutators  []func(*Config)
+		wantEarly bool
+	}{
+		{name: "in-memory queue always early", gateOn: false, wantEarly: true},
+		{name: "in-memory queue with metadata_keys still early", gateOn: false, mutators: []func(*Config){withMetadataKeys}, wantEarly: true},
+		{name: "persistent queue, gate off -> legacy", gateOn: false, mutators: []func(*Config){withStorage}, wantEarly: false},
+		{name: "persistent queue, gate on -> early", gateOn: true, mutators: []func(*Config){withStorage}, wantEarly: true},
+		{name: "persistent queue, gate on, metadata_keys -> legacy", gateOn: true, mutators: []func(*Config){withStorage, withMetadataKeys}, wantEarly: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, featuregate.GlobalRegistry().Set(metadata.ExporterElasticsearchEarlyEncodingWithPersistentQueueFeatureGate.ID(), tc.gateOn))
+			t.Cleanup(func() {
+				require.NoError(t, featuregate.GlobalRegistry().Set(metadata.ExporterElasticsearchEarlyEncodingWithPersistentQueueFeatureGate.ID(), false))
+			})
+			cfg := withDefaultConfig(tc.mutators...)
+			require.Equal(t, tc.wantEarly, useEarlyEncoding(cfg))
+		})
+	}
+}
+
+func TestLogsRequestEncoding_RoundTrip(t *testing.T) {
+	enc := encodedEncoding[plog.Logs]{} // convert unused for the early-encoded path
+
+	items := []encodedItem{
+		{index: "logs-a", docID: "id-1", pipeline: "pipe-1", action: "create", mappingMode: MappingOTel, target: targetDefault, doc: []byte(`{"@timestamp":"t","message":"one"}`)},
+		{index: "logs-b", action: "create", mappingMode: MappingECS, dynamicTemplates: map[string]string{"field.one": "tmpl", "field.two": "tmpl2"}, doc: []byte(`{"message":"two"}`)},
+		// a profiling item exercises a non-default session target + update action
+		{index: "profiling-executables", docID: "exe-1", action: "update", mappingMode: MappingOTel, target: targetProfilingExecutables, doc: []byte(`{"exe":1}`)},
+		{index: "", docID: "", pipeline: "", action: "create", mappingMode: MappingRaw, doc: []byte("{}")}, // empty string fields
+	}
+	orig := newEncodedRequest(items)
+
+	b, err := enc.Marshal(context.Background(), orig)
+	require.NoError(t, err)
+	require.Equal(t, earlyEncodedMagic, b[0])
+	require.Equal(t, earlyEncodedVersion, b[1])
+
+	ctx, req, err := enc.Unmarshal(b)
+	require.NoError(t, err)
+	require.NotNil(t, ctx)
+
+	got := req.(*encodedRequest)
+	require.Equal(t, orig.ItemsCount(), got.ItemsCount())
+	require.Equal(t, orig.BytesSize(), got.BytesSize())
+	require.Equal(t, items, got.items)
+}
+
+func TestLogsRequestEncoding_MarshalWrongType(t *testing.T) {
+	enc := encodedEncoding[plog.Logs]{}
+	_, err := enc.Marshal(context.Background(), stubRequest{})
+	require.ErrorContains(t, err, "expected *encodedRequest")
+}
+
+func TestLogsRequestEncoding_UnsupportedVersion(t *testing.T) {
+	enc := encodedEncoding[plog.Logs]{}
+	_, _, err := enc.Unmarshal([]byte{earlyEncodedMagic, 0x02, 0x00})
+	require.ErrorContains(t, err, "unsupported early-encoded payload version")
+}
+
+func TestLogsRequestEncoding_CorruptPayload(t *testing.T) {
+	enc := encodedEncoding[plog.Logs]{}
+
+	// A well-formed request truncated mid-item must error, not panic.
+	full, err := enc.Marshal(context.Background(),
+		newEncodedRequest(makeItems(10, 20, 30)))
+	require.NoError(t, err)
+	for _, cut := range []int{3, 6, len(full) - 1} {
+		_, _, err := enc.Unmarshal(full[:cut])
+		require.Error(t, err)
+	}
+
+	// An absurd item count must be rejected rather than allocating.
+	bad := []byte{earlyEncodedMagic, earlyEncodedVersion}
+	bad = binary.AppendUvarint(bad, ^uint64(0))
+	_, _, err = enc.Unmarshal(bad)
+	require.ErrorContains(t, err, "item count exceeds payload size")
+
+	// An out-of-range mapping mode must be rejected.
+	badMode := []byte{earlyEncodedMagic, earlyEncodedVersion}
+	badMode = binary.AppendUvarint(badMode, 1)                       // one item
+	badMode = binary.AppendUvarint(badMode, uint64(NumMappingModes)) // invalid mapping mode
+	_, _, err = enc.Unmarshal(badMode)
+	require.ErrorContains(t, err, "invalid mapping mode")
+
+	// An out-of-range session target must be rejected.
+	badTarget := []byte{earlyEncodedMagic, earlyEncodedVersion}
+	badTarget = binary.AppendUvarint(badTarget, 1)                         // one item
+	badTarget = binary.AppendUvarint(badTarget, uint64(MappingOTel))       // valid mapping mode
+	badTarget = binary.AppendUvarint(badTarget, uint64(numSessionTargets)) // invalid target
+	_, _, err = enc.Unmarshal(badTarget)
+	require.ErrorContains(t, err, "invalid session target")
+
+	// An oversized per-item length prefix must be rejected, not panic. A length
+	// near 2^64 would overflow a pos+n bounds check and slice with high < low.
+	badLen := []byte{earlyEncodedMagic, earlyEncodedVersion}
+	badLen = binary.AppendUvarint(badLen, 1)                   // one item
+	badLen = binary.AppendUvarint(badLen, uint64(MappingOTel)) // valid mapping mode
+	badLen = binary.AppendUvarint(badLen, uint64(targetDefault))
+	badLen = binary.AppendUvarint(badLen, ^uint64(0)) // absurd index length prefix
+	require.NotPanics(t, func() {
+		_, _, err = enc.Unmarshal(badLen)
+	})
+	require.Error(t, err)
+}
+
+// assertReadsLegacyPayload verifies that encodedEncoding[T].Unmarshal
+// transparently decodes both legacy on-disk formats a persistent queue may hold
+// from before early encoding was enabled: a pdatareq context-wrapped payload and
+// a plain pdata protobuf payload. It re-encodes them through the ingest converter
+// and expects a non-empty request. This guards the per-signal unmarshalCtx /
+// unmarshalPlain wiring against copy/paste mistakes between signals.
+func assertReadsLegacyPayload[T any](
+	t *testing.T,
+	enc encodedEncoding[T],
+	marshalCtx func(context.Context, T) ([]byte, error),
+	marshalPlain func(T) ([]byte, error),
+	data T,
+) {
+	t.Helper()
+	t.Run("pdatareq wrapped payload", func(t *testing.T) {
+		legacy, err := marshalCtx(context.Background(), data)
+		require.NoError(t, err)
+		require.NotEqual(t, earlyEncodedMagic, legacy[0]) // ensure it is not our format
+
+		_, req, err := enc.Unmarshal(legacy)
+		require.NoError(t, err)
+		require.Positive(t, req.(*encodedRequest).ItemsCount())
+	})
+
+	t.Run("plain protobuf payload", func(t *testing.T) {
+		legacy, err := marshalPlain(data)
+		require.NoError(t, err)
+
+		_, req, err := enc.Unmarshal(legacy)
+		require.NoError(t, err)
+		require.Positive(t, req.(*encodedRequest).ItemsCount())
+	})
+}
+
+func TestRequestEncoding_ReadsLegacyPayload(t *testing.T) {
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoints = []string{"http://localhost:9200"}
+		cfg.Mapping.Mode = "otel"
+	})
+	newExp := func(t *testing.T, index string) *elasticsearchExporter {
+		exp, err := newExporter(cfg, exportertest.NewNopSettings(metadata.Type), index)
+		require.NoError(t, err)
+		return exp
+	}
+
+	t.Run("logs", func(t *testing.T) {
+		exp := newExp(t, cfg.LogsIndex)
+		enc := encodedEncoding[plog.Logs]{
+			convert:        newEncodedConverter(exp, exp.encodeLogRecords),
+			unmarshalCtx:   pdatareq.UnmarshalLogs,
+			unmarshalPlain: (&plog.ProtoUnmarshaler{}).UnmarshalLogs,
+		}
+		assertReadsLegacyPayload(t, enc, pdatareq.MarshalLogs, (&plog.ProtoMarshaler{}).MarshalLogs, benchLogs(3))
+	})
+
+	t.Run("metrics", func(t *testing.T) {
+		exp := newExp(t, cfg.MetricsIndex)
+		enc := encodedEncoding[pmetric.Metrics]{
+			convert:        newEncodedConverter(exp, exp.encodeMetricRecords),
+			unmarshalCtx:   pdatareq.UnmarshalMetrics,
+			unmarshalPlain: (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics,
+		}
+		assertReadsLegacyPayload(t, enc, pdatareq.MarshalMetrics, (&pmetric.ProtoMarshaler{}).MarshalMetrics, benchMetrics(3))
+	})
+
+	t.Run("traces", func(t *testing.T) {
+		exp := newExp(t, cfg.TracesIndex)
+		enc := encodedEncoding[ptrace.Traces]{
+			convert:        newEncodedConverter(exp, exp.encodeTraceRecords),
+			unmarshalCtx:   pdatareq.UnmarshalTraces,
+			unmarshalPlain: (&ptrace.ProtoUnmarshaler{}).UnmarshalTraces,
+		}
+		assertReadsLegacyPayload(t, enc, pdatareq.MarshalTraces, (&ptrace.ProtoMarshaler{}).MarshalTraces, benchTraces(3))
+	})
+
+	t.Run("profiles", func(t *testing.T) {
+		exp := newExp(t, "")
+		enc := encodedEncoding[pprofile.Profiles]{
+			convert:        newEncodedConverter(exp, exp.encodeProfileRecords),
+			unmarshalCtx:   pdatareq.UnmarshalProfiles,
+			unmarshalPlain: (&pprofile.ProtoUnmarshaler{}).UnmarshalProfiles,
+		}
+		assertReadsLegacyPayload(t, enc, pdatareq.MarshalProfiles, (&pprofile.ProtoMarshaler{}).MarshalProfiles, benchProfiles(1))
+	})
+}
+
+func TestCreateLogsExporter_EarlyEncodingWithPersistentQueue(t *testing.T) {
+	require.NoError(t, featuregate.GlobalRegistry().Set(metadata.ExporterElasticsearchEarlyEncodingWithPersistentQueueFeatureGate.ID(), true))
+	t.Cleanup(func() {
+		require.NoError(t, featuregate.GlobalRegistry().Set(metadata.ExporterElasticsearchEarlyEncodingWithPersistentQueueFeatureGate.ID(), false))
+	})
+
+	rec := newBulkRecorder()
+	server := newESTestServer(t, func(docs []itemRequest) ([]itemResponse, error) {
+		rec.Record(docs)
+		return itemsAllOK(docs)
+	})
+
+	storageID := component.MustNewID("file_storage")
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoints = []string{server.URL}
+		cfg.QueueBatchConfig.Get().NumConsumers = 1
+		cfg.QueueBatchConfig.Get().Batch.Get().FlushTimeout = 10 * time.Millisecond
+		cfg.QueueBatchConfig.Get().StorageID = &storageID
+	})
+
+	f := NewFactory()
+	exp, err := f.CreateLogs(context.Background(), exportertest.NewNopSettings(metadata.Type), cfg)
+	require.NoError(t, err)
+
+	host := &storageTestHost{
+		ext: map[component.ID]component.Component{
+			storageID: newInMemoryStorageExtension(),
+		},
+	}
+	require.NoError(t, exp.Start(context.Background(), host))
+	t.Cleanup(func() { require.NoError(t, exp.Shutdown(context.Background())) })
+
+	logs := plog.NewLogs()
+	rl := logs.ResourceLogs().AppendEmpty()
+	sl := rl.ScopeLogs().AppendEmpty()
+	sl.LogRecords().AppendEmpty().Body().SetStr("hello")
+
+	require.NoError(t, exp.ConsumeLogs(context.Background(), logs))
+	rec.WaitItems(1)
+}

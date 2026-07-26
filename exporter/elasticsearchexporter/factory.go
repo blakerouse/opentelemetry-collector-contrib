@@ -21,6 +21,11 @@ import (
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/xexporterhelper"
 	"go.opentelemetry.io/collector/exporter/xexporter"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/pprofile"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	pdatareq "go.opentelemetry.io/collector/pdata/xpdata/request"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/metadata"
 )
@@ -90,6 +95,12 @@ func createDefaultConfig() component.Config {
 	}
 }
 
+// Every signal follows the same shape: when useEarlyEncoding is true (the
+// default; see encoded.go) each record is serialized at ingest via the
+// request-based API (NewXRequest + newEncodedConverter + pushEncodedRequest);
+// otherwise the exporter falls back to the legacy pdata path (NewX + pushXData),
+// which serializes on the sending-queue consumer and stores pdata in the queue.
+
 // createLogsExporter creates a new exporter for logs.
 //
 // Logs are directly indexed into Elasticsearch.
@@ -99,29 +110,23 @@ func createLogsExporter(
 	cfg component.Config,
 ) (exporter.Logs, error) {
 	cf := cfg.(*Config)
-
 	handleDeprecatedConfig(cf, set.Logger)
 	handleTelemetryConfig(cf, set.Logger)
 
-	exporter, err := newExporter(cf, set, cf.LogsIndex)
+	exp, err := newExporter(cf, set, cf.LogsIndex)
 	if err != nil {
 		return nil, err
 	}
 
-	qbs := xexporterhelper.NewLogsQueueBatchSettings()
-	if len(cf.MetadataKeys) > 0 {
-		partitioner := metadataKeysPartitioner{keys: cf.MetadataKeys}
-		qbs.Partitioner = partitioner
-		qbs.MergeCtx = partitioner.MergeCtx
+	if useEarlyEncoding(cf) {
+		converter := newEncodedConverter(exp, exp.encodeLogRecords)
+		qbs := earlyEncodingQueueBatchSettings(cf, converter, pdatareq.UnmarshalLogs, (&plog.ProtoUnmarshaler{}).UnmarshalLogs)
+		return xexporterhelper.NewLogsRequest(ctx, set, converter, exp.pushEncodedRequest,
+			exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
 	}
-
-	return exporterhelper.NewLogs(
-		ctx,
-		set,
-		cfg,
-		exporter.pushLogsData,
-		exporterhelperOptions(cf, exporter.Start, exporter.Shutdown, qbs)...,
-	)
+	qbs := legacyQueueBatchSettings(cf, xexporterhelper.NewLogsQueueBatchSettings())
+	return exporterhelper.NewLogs(ctx, set, cfg, exp.pushLogsData,
+		exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
 }
 
 func createMetricsExporter(
@@ -133,25 +138,20 @@ func createMetricsExporter(
 	handleDeprecatedConfig(cf, set.Logger)
 	handleTelemetryConfig(cf, set.Logger)
 
-	exporter, err := newExporter(cf, set, cf.MetricsIndex)
+	exp, err := newExporter(cf, set, cf.MetricsIndex)
 	if err != nil {
 		return nil, err
 	}
 
-	qbs := xexporterhelper.NewMetricsQueueBatchSettings()
-	if len(cf.MetadataKeys) > 0 {
-		partitioner := metadataKeysPartitioner{keys: cf.MetadataKeys}
-		qbs.Partitioner = partitioner
-		qbs.MergeCtx = partitioner.MergeCtx
+	if useEarlyEncoding(cf) {
+		converter := newEncodedConverter(exp, exp.encodeMetricRecords)
+		qbs := earlyEncodingQueueBatchSettings(cf, converter, pdatareq.UnmarshalMetrics, (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics)
+		return xexporterhelper.NewMetricsRequest(ctx, set, converter, exp.pushEncodedRequest,
+			exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
 	}
-
-	return exporterhelper.NewMetrics(
-		ctx,
-		set,
-		cfg,
-		exporter.pushMetricsData,
-		exporterhelperOptions(cf, exporter.Start, exporter.Shutdown, qbs)...,
-	)
+	qbs := legacyQueueBatchSettings(cf, xexporterhelper.NewMetricsQueueBatchSettings())
+	return exporterhelper.NewMetrics(ctx, set, cfg, exp.pushMetricsData,
+		exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
 }
 
 func createTracesExporter(ctx context.Context,
@@ -162,25 +162,20 @@ func createTracesExporter(ctx context.Context,
 	handleDeprecatedConfig(cf, set.Logger)
 	handleTelemetryConfig(cf, set.Logger)
 
-	exporter, err := newExporter(cf, set, cf.TracesIndex)
+	exp, err := newExporter(cf, set, cf.TracesIndex)
 	if err != nil {
 		return nil, err
 	}
 
-	qbs := xexporterhelper.NewTracesQueueBatchSettings()
-	if len(cf.MetadataKeys) > 0 {
-		partitioner := metadataKeysPartitioner{keys: cf.MetadataKeys}
-		qbs.Partitioner = partitioner
-		qbs.MergeCtx = partitioner.MergeCtx
+	if useEarlyEncoding(cf) {
+		converter := newEncodedConverter(exp, exp.encodeTraceRecords)
+		qbs := earlyEncodingQueueBatchSettings(cf, converter, pdatareq.UnmarshalTraces, (&ptrace.ProtoUnmarshaler{}).UnmarshalTraces)
+		return xexporterhelper.NewTracesRequest(ctx, set, converter, exp.pushEncodedRequest,
+			exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
 	}
-
-	return exporterhelper.NewTraces(
-		ctx,
-		set,
-		cfg,
-		exporter.pushTraceData,
-		exporterhelperOptions(cf, exporter.Start, exporter.Shutdown, qbs)...,
-	)
+	qbs := legacyQueueBatchSettings(cf, xexporterhelper.NewTracesQueueBatchSettings())
+	return exporterhelper.NewTraces(ctx, set, cfg, exp.pushTraceData,
+		exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
 }
 
 // createProfilesExporter creates a new exporter for profiles.
@@ -192,29 +187,60 @@ func createProfilesExporter(
 	cfg component.Config,
 ) (xexporter.Profiles, error) {
 	cf := cfg.(*Config)
-
 	handleDeprecatedConfig(cf, set.Logger)
 	handleTelemetryConfig(cf, set.Logger)
 
-	exporter, err := newExporter(cf, set, "")
+	exp, err := newExporter(cf, set, "")
 	if err != nil {
 		return nil, err
 	}
 
-	qbs := xexporterhelper.NewProfilesQueueBatchSettings()
+	if useEarlyEncoding(cf) {
+		converter := newEncodedConverter(exp, exp.encodeProfileRecords)
+		qbs := earlyEncodingQueueBatchSettings(cf, converter, pdatareq.UnmarshalProfiles, (&pprofile.ProtoUnmarshaler{}).UnmarshalProfiles)
+		return xexporterhelper.NewProfilesRequest(ctx, set, converter, exp.pushEncodedRequest,
+			exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
+	}
+	qbs := legacyQueueBatchSettings(cf, xexporterhelper.NewProfilesQueueBatchSettings())
+	return xexporterhelper.NewProfiles(ctx, set, cfg, exp.pushProfilesData,
+		exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
+}
+
+// earlyEncodingQueueBatchSettings builds the QueueBatchSettings for the
+// request-based (early encoding) path. When a persistent sending queue is
+// configured it installs the custom Encoding so requests can be marshaled to
+// disk (and legacy pdata payloads still read back); see encoded.go.
+func earlyEncodingQueueBatchSettings[T any](
+	cf *Config,
+	converter xexporterhelper.RequestConverterFunc[T],
+	unmarshalCtx func([]byte) (context.Context, T, error),
+	unmarshalPlain func([]byte) (T, error),
+) xexporterhelper.QueueBatchSettings {
+	var qbs xexporterhelper.QueueBatchSettings
+	if cf.QueueBatchConfig.HasValue() && cf.QueueBatchConfig.Get().StorageID != nil {
+		qbs.Encoding = encodedEncoding[T]{
+			convert:        converter,
+			unmarshalCtx:   unmarshalCtx,
+			unmarshalPlain: unmarshalPlain,
+		}
+	}
+	applyMetadataPartitioner(cf, &qbs)
+	return qbs
+}
+
+// legacyQueueBatchSettings augments the signal's built-in pdata QueueBatchSettings
+// with metadata_keys partitioning if configured.
+func legacyQueueBatchSettings(cf *Config, qbs xexporterhelper.QueueBatchSettings) xexporterhelper.QueueBatchSettings {
+	applyMetadataPartitioner(cf, &qbs)
+	return qbs
+}
+
+func applyMetadataPartitioner(cf *Config, qbs *xexporterhelper.QueueBatchSettings) {
 	if len(cf.MetadataKeys) > 0 {
 		partitioner := metadataKeysPartitioner{keys: cf.MetadataKeys}
 		qbs.Partitioner = partitioner
 		qbs.MergeCtx = partitioner.MergeCtx
 	}
-
-	return xexporterhelper.NewProfiles(
-		ctx,
-		set,
-		cfg,
-		exporter.pushProfilesData,
-		exporterhelperOptions(cf, exporter.Start, exporter.Shutdown, qbs)...,
-	)
 }
 
 func exporterhelperOptions(

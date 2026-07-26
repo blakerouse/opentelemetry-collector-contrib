@@ -110,3 +110,13 @@ Number of uncompressed bytes flushed by the indexer.
 | Unit | Metric Type | Value Type | Monotonic | Stability |
 | ---- | ----------- | ---------- | --------- | --------- |
 | By | Sum | Int | true | Alpha |
+
+## Feature Gates
+
+This component has the following feature gates:
+
+| Feature Gate | Stage | Description | From Version | To Version | Reference |
+| ------------ | ----- | ----------- | ------------ | ---------- | --------- |
+| `exporter.elasticsearch.earlyEncodingWithPersistentQueue` | alpha | When enabled, the Elasticsearch exporter performs ingest-time (early) encoding of records even when a persistent sending queue (sending_queue.storage) is configured, storing already-encoded bulk items in the queue. On drain both early-encoded and legacy pdata payloads are supported, so the gate can be enabled on upgrade without draining the queue; only downgrades require draining. Not used when metadata_keys partitioning is configured, because the early-encoded format does not carry the request context. | v0.158.0 | N/A | [Link](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/49835) |
+
+For more information about feature gates, see the [Feature Gates](https://github.com/open-telemetry/opentelemetry-collector/blob/main/featuregate/README.md) documentation.
