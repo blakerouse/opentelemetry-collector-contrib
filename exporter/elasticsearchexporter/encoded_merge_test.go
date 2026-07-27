@@ -134,10 +134,13 @@ func TestConsumeEncodedItems_DeferredECSMetricsGroupAcrossPayloads(t *testing.T)
 	require.Len(t, fullItems, 1)
 	require.Equal(t, itemKindDeferredMetrics, fullItems[0].kind)
 	// The payload is held by reference — nothing is copied or serialized at
-	// ingest (the legacy pdata path's memory profile).
+	// ingest (the legacy pdata path's memory profile). All scopes are
+	// deferred, so deferredScopes stays nil (whole payload) and the size is
+	// the exact proto size.
 	require.Nil(t, fullItems[0].doc)
+	require.Nil(t, fullItems[0].deferredScopes)
 	require.Positive(t, fullItems[0].deferredMetrics.ResourceMetrics().Len())
-	require.Positive(t, fullItems[0].size())
+	require.Equal(t, (&pmetric.ProtoMarshaler{}).MetricsSize(full), fullItems[0].size())
 	require.NoError(t, expFull.consumeEncodedItems(context.Background(), fullItems))
 	fullDoc := decodeSingleDoc(t, recFull)
 
@@ -268,6 +271,35 @@ func TestConsumeEncodedItems_MixedModePayload(t *testing.T) {
 	}
 	require.Equal(t, 1, otelDocs)
 	require.Equal(t, 1, ecsDocs)
+
+	// Sizing covers only the deferred scope, not the whole payload: at least
+	// the exact filtered proto size (the approximation may overcount slightly)
+	// and strictly less than the full payload's proto size.
+	require.Len(t, items[1].deferredScopes, 1)
+	fullSize := (&pmetric.ProtoMarshaler{}).MetricsSize(m)
+	filteredExact := (&pmetric.ProtoMarshaler{}).MetricsSize(filteredDeferredMetrics(m, items[1].deferredScopes))
+	require.GreaterOrEqual(t, items[1].deferredSize, filteredExact)
+	require.Less(t, items[1].deferredSize, fullSize)
+
+	// Persistence also covers only the deferred scope: the OTel scope already
+	// exists as an encoded doc item and must not be stored twice.
+	enc := encodedEncoding[pmetric.Metrics]{}
+	b, err := enc.Marshal(context.Background(), newEncodedRequest(items))
+	require.NoError(t, err)
+	_, req, err := enc.Unmarshal(b)
+	require.NoError(t, err)
+	restored := req.(*encodedRequest).items
+	require.Len(t, restored, 2)
+	persisted, err := (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics(restored[1].doc)
+	require.NoError(t, err)
+	require.Equal(t, 1, persisted.ResourceMetrics().Len())
+	require.Equal(t, 1, persisted.ResourceMetrics().At(0).ScopeMetrics().Len())
+	require.Equal(t, "ecs-scope", persisted.ResourceMetrics().At(0).ScopeMetrics().At(0).Scope().Name())
+
+	// Draining the restored items still produces exactly the same two docs.
+	expDisk, recDisk := newMetricsMergeExporter(t)
+	require.NoError(t, expDisk.consumeEncodedItems(context.Background(), restored))
+	require.Len(t, recDisk.WaitItems(2), 2)
 }
 
 // TestRequestEncoding_DeferredMetricsMarshaledLazily: a deferred item holds
@@ -320,4 +352,20 @@ func TestRequestEncoding_CorruptMergeFields(t *testing.T) {
 	require.NoError(t, err)
 	_, _, err = enc.Unmarshal(b)
 	require.ErrorContains(t, err, "invalid metric fragment offsets")
+}
+
+// TestMetricsConverter_UnsupportedModeFailsConversion: when the resolved
+// mapping mode cannot encode the signal at all (raw mode does not support
+// metrics), every group fails deterministically and the conversion must
+// return an error rather than reporting success while dropping 100% of the
+// payload.
+func TestMetricsConverter_UnsupportedModeFailsConversion(t *testing.T) {
+	ts := time.Unix(1719000000, 0).UTC()
+	exp, _ := newMetricsMergeExporter(t)
+
+	m := buildGauges("raw", ts, []string{"m.a"}, []float64{1})
+	req, err := newEncodedConverter(exp, exp.encodeMetricRecords)(context.Background(), m)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "does not support metrics")
+	require.Nil(t, req)
 }

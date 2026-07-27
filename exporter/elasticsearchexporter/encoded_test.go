@@ -328,6 +328,37 @@ func TestSplitLogsByBytes(t *testing.T) {
 	}
 }
 
+// TestSplitByBytes_OversizedItemSentNotDropped pins a deliberate deviation
+// from the upstream pdata requests: an item that individually exceeds maxSize
+// is emitted as its own over-limit single-item request rather than dropped
+// with an error. This relies on the batcher flushing oversize results
+// immediately (never retaining them as the pending batch) and on the bulk
+// session's maxFlushBytes force-flush bounding the actual request body. If
+// this test breaks because the batcher contract changed, revisit that
+// reliance rather than silently dropping records.
+func TestSplitByBytes_OversizedItemSentNotDropped(t *testing.T) {
+	const maxSize = 50
+	out := splitByBytes(makeItems(10, 100, 5), maxSize)
+	require.Len(t, out, 3)
+
+	// No item is lost: the oversized one is sent, alone, exceeding maxSize.
+	require.ElementsMatch(t, []string{"idx-0", "idx-1", "idx-2"}, itemKeys(out))
+	var oversize []xexporterhelper.Request
+	for _, req := range out {
+		if req.BytesSize() > maxSize {
+			oversize = append(oversize, req)
+		}
+	}
+	require.Len(t, oversize, 1)
+	require.Equal(t, 1, oversize[0].ItemsCount())
+	require.Equal(t, 100, oversize[0].BytesSize())
+
+	// Everything else stays within the limit, and the last request is the
+	// smallest per the MergeSplit contract, so the retained pending batch can
+	// never be the oversized request.
+	require.LessOrEqual(t, out[len(out)-1].BytesSize(), maxSize)
+}
+
 func TestSplitLogsByCount(t *testing.T) {
 	t.Run("non-positive maxCount keeps single request", func(t *testing.T) {
 		out := splitByCount(makeItems(1, 1, 1), 0)
@@ -383,12 +414,11 @@ func TestSplitDoesNotAliasSiblings(t *testing.T) {
 	})
 }
 
-func TestNewLogsRequestConverter_PerRecordErrorsDropOnlyFailedRecords(t *testing.T) {
+func TestNewLogsRequestConverter_AllRecordsFailedReturnsError(t *testing.T) {
 	// An invalid Logstash date format makes routing fail for every record.
-	// Per-record encoding failures are deterministic, so the converter must not
-	// fail the conversion (which would drop the whole batch): it drops the
-	// failed records, logging and counting them, and still returns a request
-	// with whatever encoded successfully — here, nothing.
+	// When nothing at all encodes, the conversion must fail: returning an
+	// empty request would report success upstream while silently dropping the
+	// whole payload.
 	cfg := withDefaultConfig(func(cfg *Config) {
 		cfg.Endpoints = []string{"http://localhost:9200"}
 		cfg.Mapping.Mode = "otel"
@@ -402,8 +432,8 @@ func TestNewLogsRequestConverter_PerRecordErrorsDropOnlyFailedRecords(t *testing
 	require.NoError(t, err)
 
 	req, err := newEncodedConverter(exp, exp.encodeLogRecords)(context.Background(), benchLogs(3))
-	require.NoError(t, err)
-	require.Equal(t, 0, req.(*encodedRequest).ItemsCount())
+	require.Error(t, err)
+	require.Nil(t, req)
 }
 
 func TestNewLogsRequestConverter_SendsGoodRecordsDespitePerRecordErrors(t *testing.T) {
@@ -1358,4 +1388,30 @@ func TestPersistedEnumValuesAreStable(t *testing.T) {
 	require.Equal(t, itemKind(1), itemKindMergeableMetrics)
 	require.Equal(t, itemKind(2), itemKindDeferredMetrics)
 	require.Equal(t, itemKind(3), numItemKinds)
+}
+
+// TestConsumeEncodedItems_DisallowedMappingMode: an item drained from a
+// persistent queue can carry a mapping mode that has since been removed from
+// mapping::allowed_modes; there is no bulk indexer for it, and consuming it
+// must fail with an error rather than panic on the nil indexer (which would be
+// a crash loop, since the persisted item is redelivered on restart).
+func TestConsumeEncodedItems_DisallowedMappingMode(t *testing.T) {
+	server := newBenchESServer(t, nil)
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoints = []string{server.URL}
+		cfg.Mapping.AllowedModes = []string{"ecs"}
+	})
+	exp, err := newExporter(cfg, exportertest.NewNopSettings(metadata.Type), cfg.LogsIndex)
+	require.NoError(t, err)
+	require.NoError(t, exp.Start(context.Background(), componenttest.NewNopHost()))
+	t.Cleanup(func() { require.NoError(t, exp.Shutdown(context.Background())) })
+
+	items := []encodedItem{
+		{index: "logs-generic", action: "create", mappingMode: MappingOTel, target: targetDefault, doc: []byte(`{"a":1}`)},
+	}
+	var consumeErr error
+	require.NotPanics(t, func() {
+		consumeErr = exp.consumeEncodedItems(context.Background(), items)
+	})
+	require.ErrorContains(t, consumeErr, "not in mapping::allowed_modes")
 }

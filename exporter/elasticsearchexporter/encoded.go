@@ -105,8 +105,14 @@ type encodedItem struct {
 	// persisted (see marshalEncodedRequest); items read back from disk have doc
 	// set instead. For deferred items, mappingMode records the request-default
 	// mapping mode so the consumer can re-resolve scope modes deterministically,
-	// and deferredSize is the payload's proto size for the byte sizers.
+	// and deferredSize is the deferred data's proto size for the byte sizers.
+	// deferredScopes, set only for a mixed-mode payload, lists the scopes that
+	// were actually deferred (nil = all of them): sizing and persistence are
+	// restricted to those, since the payload's other scopes already exist as
+	// encoded doc items and must not be counted or stored twice. It is never
+	// serialized — persisted payloads are pre-filtered.
 	deferredMetrics pmetric.Metrics
+	deferredScopes  []scopeRef
 	deferredSize    int
 }
 
@@ -188,9 +194,14 @@ func (r *encodedRequest) MergeSplit(
 
 // splitByBytes places items into bins of at most maxSize bytes (measured by
 // encoded document size). Items that individually equal or exceed maxSize are
-// emitted as their own single-item Request. Only the last Request is guaranteed
-// to be the smallest, so we track the running minimum and swap it to the end
-// once rather than sorting.
+// emitted as their own single-item Request, deliberately exceeding maxSize:
+// the upstream pdata requests drop such records with an error instead, but the
+// batcher flushes oversize results immediately (never retaining them), and the
+// bulk session's maxFlushBytes force-flush bounds the actual request body — so
+// sending the record is strictly friendlier than dropping it. Pinned by
+// TestSplitByBytes_OversizedItemSentNotDropped. Only the last Request is
+// guaranteed to be the smallest, so we track the running minimum and swap it
+// to the end once rather than sorting.
 func splitByBytes(items []encodedItem, maxSize int) []xexporterhelper.Request {
 	var out []xexporterhelper.Request
 	var curSize, minIdx, minSize int
@@ -259,8 +270,10 @@ func splitByCount(items []encodedItem, maxCount int) []xexporterhelper.Request {
 // into encoded bulk items at ingest time. perRecordErrs are deterministic
 // per-record encoding errors: the legacy push path returns them to the caller
 // after flushing, while the converter path drops only the failed records
-// (logging and counting them) and sends the rest. A non-nil err aborts the
-// whole batch (e.g. mapping-mode resolution failure).
+// (logging and counting them) and sends the rest — unless every record failed,
+// in which case the conversion fails so a total drop is not reported as
+// success. A non-nil err aborts the whole batch (e.g. mapping-mode resolution
+// failure).
 type recordEncoder[T any] func(ctx context.Context, data T) (items []encodedItem, perRecordErrs []error, err error)
 
 // convertToEncoded encodes data into an *encodedRequest, dropping (and logging
@@ -276,11 +289,19 @@ func convertToEncoded[T any](ctx context.Context, e *elasticsearchExporter, enco
 		return nil, err
 	}
 	if len(perRecordErrs) > 0 {
-		// Per-record encoding failures are deterministic, so retrying cannot
-		// fix them, and returning an error here would make exporterhelper
-		// drop the whole request, including the successfully encoded records.
-		// Send what we can instead: drop only the failed records, logging
-		// them and counting them as failed_client documents.
+		// Every record failed deterministically (e.g. the resolved mapping
+		// mode does not support this signal at all). There is nothing to send,
+		// and returning success would hide a total drop from the pipeline;
+		// fail the conversion so the caller sees the error, as the legacy
+		// push path did.
+		if len(items) == 0 {
+			return nil, errors.Join(perRecordErrs...)
+		}
+		// Partial failure: per-record encoding failures are deterministic, so
+		// retrying cannot fix them, and returning an error here would make
+		// exporterhelper drop the whole request, including the successfully
+		// encoded records. Send what we can instead: drop only the failed
+		// records, logging them and counting them as failed_client documents.
 		e.set.Logger.Warn("dropping records that failed to encode",
 			zap.Int("dropped_records", len(perRecordErrs)),
 			zap.Error(errors.Join(perRecordErrs...)))
@@ -918,7 +939,7 @@ func marshalEncodedRequest(r *encodedRequest) ([]byte, error) {
 		doc := it.doc
 		if it.kind == itemKindDeferredMetrics && doc == nil {
 			var err error
-			doc, err = (&pmetric.ProtoMarshaler{}).MarshalMetrics(it.deferredMetrics)
+			doc, err = (&pmetric.ProtoMarshaler{}).MarshalMetrics(filteredDeferredMetrics(it.deferredMetrics, it.deferredScopes))
 			if err != nil {
 				return nil, fmt.Errorf("elasticsearchexporter: failed to marshal deferred metrics payload: %w", err)
 			}
@@ -926,6 +947,55 @@ func marshalEncodedRequest(r *encodedRequest) ([]byte, error) {
 		buf = appendLenPrefixed(buf, doc)
 	}
 	return buf, nil
+}
+
+// filteredDeferredMetrics returns the payload restricted to the given scopes
+// (in walk order), so a mixed-mode payload persists only its deferred scopes.
+// A nil scopes slice means the whole payload is deferred, which is returned
+// as-is with no copying — the common, uniform-mode case.
+func filteredDeferredMetrics(m pmetric.Metrics, scopes []scopeRef) pmetric.Metrics {
+	if len(scopes) == 0 {
+		return m
+	}
+	out := pmetric.NewMetrics()
+	lastRM := -1
+	var rmOut pmetric.ResourceMetrics
+	for _, ref := range scopes {
+		rmIn := m.ResourceMetrics().At(ref.rm)
+		if ref.rm != lastRM {
+			rmOut = out.ResourceMetrics().AppendEmpty()
+			rmIn.Resource().CopyTo(rmOut.Resource())
+			rmOut.SetSchemaUrl(rmIn.SchemaUrl())
+			lastRM = ref.rm
+		}
+		rmIn.ScopeMetrics().At(ref.sm).CopyTo(rmOut.ScopeMetrics().AppendEmpty())
+	}
+	return out
+}
+
+// deferredMetricsSize approximates the proto size of the payload restricted to
+// the given scopes: each parent ResourceMetrics' full size minus its
+// non-deferred scopes. It slightly overcounts (the removed scopes' framing
+// bytes remain included), which is the safe direction for byte thresholds.
+// scopes must be in walk order (as returned by collectMetricsGroups).
+func deferredMetricsSize(m pmetric.Metrics, scopes []scopeRef) int {
+	sizer := pmetric.ProtoMarshaler{}
+	var size int
+	for i := 0; i < len(scopes); {
+		rmIdx := scopes[i].rm
+		rm := m.ResourceMetrics().At(rmIdx)
+		size += sizer.ResourceMetricsSize(rm)
+		deferred := make(map[int]struct{})
+		for ; i < len(scopes) && scopes[i].rm == rmIdx; i++ {
+			deferred[scopes[i].sm] = struct{}{}
+		}
+		for smIdx, sm := range rm.ScopeMetrics().All() {
+			if _, ok := deferred[smIdx]; !ok {
+				size -= sizer.ScopeMetricsSize(sm)
+			}
+		}
+	}
+	return size
 }
 
 func unmarshalEncodedRequest(b []byte) (*encodedRequest, error) {

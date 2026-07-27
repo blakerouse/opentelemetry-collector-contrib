@@ -275,17 +275,35 @@ func (e *elasticsearchExporter) encodeMetricRecords(ctx context.Context, metrics
 	// marshaling happens lazily, only if a persistent queue writes the item to
 	// disk. deferredSize is precomputed for the byte sizers (the legacy pdata
 	// path computed the same proto size for its default bytes-based batching).
-	if excluded {
-		sink.items = append(sink.items, encodedItem{
+	// For a mixed-mode payload, deferredScopes records which scopes were
+	// deferred so sizing and persistence cover only those (the other scopes
+	// already exist as encoded doc items); when every scope was deferred it
+	// stays nil, meaning the whole payload.
+	if len(excluded) > 0 {
+		item := encodedItem{
 			kind:            itemKindDeferredMetrics,
 			action:          docappender.ActionCreate,
 			mappingMode:     defaultMode,
 			target:          targetDefault,
 			deferredMetrics: metrics,
-			deferredSize:    (&pmetric.ProtoMarshaler{}).MetricsSize(metrics),
-		})
+		}
+		if len(excluded) == countScopes(metrics) {
+			item.deferredSize = (&pmetric.ProtoMarshaler{}).MetricsSize(metrics)
+		} else {
+			item.deferredScopes = excluded
+			item.deferredSize = deferredMetricsSize(metrics, excluded)
+		}
+		sink.items = append(sink.items, item)
 	}
 	return sink.items, perRecordErrs, nil
+}
+
+func countScopes(metrics pmetric.Metrics) int {
+	var n int
+	for _, rm := range metrics.ResourceMetrics().All() {
+		n += rm.ScopeMetrics().Len()
+	}
+	return n
 }
 
 // emitMetrics groups data points into documents, then encodes each group and
@@ -319,19 +337,24 @@ func newMetricsGroups() *metricsGroups {
 	return &metricsGroups{byIndex: make(map[mappingIndexKey]map[metricgroup.HashKey]*dataPointsGroup)}
 }
 
+// scopeRef addresses a scope within a payload by resource/scope index.
+type scopeRef struct {
+	rm, sm int
+}
+
 // collectMetricsGroups walks metrics and groups its data points into g,
 // resolving each scope's mapping mode from the scope attributes with
 // defaultMode as the fallback (when nil, the fallback is resolved from the
 // request context). Scopes whose resolved mode fails the include filter (nil
-// includes all) are skipped; the return values report whether any scope was
-// skipped and which fallback mode was used. The walk only reads metrics.
+// includes all) are skipped and returned (in walk order) along with the
+// fallback mode used. The walk only reads metrics.
 func (e *elasticsearchExporter) collectMetricsGroups(
 	ctx context.Context,
 	g *metricsGroups,
 	metrics pmetric.Metrics,
 	defaultMode *MappingMode,
 	include func(MappingMode) bool,
-) (excluded bool, _ MappingMode, _ error) {
+) (excluded []scopeRef, _ MappingMode, _ error) {
 	var defaultMappingMode MappingMode
 	if defaultMode != nil {
 		defaultMappingMode = *defaultMode
@@ -339,22 +362,22 @@ func (e *elasticsearchExporter) collectMetricsGroups(
 		var err error
 		defaultMappingMode, err = e.getRequestMappingMode(ctx)
 		if err != nil {
-			return false, 0, err
+			return nil, 0, err
 		}
 	}
 
-	for _, resourceMetrics := range metrics.ResourceMetrics().All() {
+	for rmIdx, resourceMetrics := range metrics.ResourceMetrics().All() {
 		resource := resourceMetrics.Resource()
 		var hasher metricgroup.DataPointHasher
 		var prevScopeMappingMode MappingMode
-		for _, scopeMetrics := range resourceMetrics.ScopeMetrics().All() {
+		for smIdx, scopeMetrics := range resourceMetrics.ScopeMetrics().All() {
 			scope := scopeMetrics.Scope()
 			mappingMode, err := e.getScopeMappingMode(scope, defaultMappingMode)
 			if err != nil {
-				return false, 0, err
+				return nil, 0, err
 			}
 			if include != nil && !include(mappingMode) {
-				excluded = true
+				excluded = append(excluded, scopeRef{rm: rmIdx, sm: smIdx})
 				continue
 			}
 			router := e.documentRouters[int(mappingMode)]
@@ -785,7 +808,11 @@ func (s *mappingModeSessions) StartSession(ctx context.Context, mappingMode Mapp
 	if session := s.sessions[int(mappingMode)]; session != nil {
 		return session
 	}
-	session := s.indexers[int(mappingMode)].StartSession(ctx)
+	indexer := s.indexers[int(mappingMode)]
+	if indexer == nil {
+		return errBulkIndexerSession{err: fmt.Errorf("mapping mode %q is not in mapping::allowed_modes", mappingMode)}
+	}
+	session := indexer.StartSession(ctx)
 	s.sessions[mappingMode] = session
 	s.sessionList = append(s.sessionList, session)
 	return session
