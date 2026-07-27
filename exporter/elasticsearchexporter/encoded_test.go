@@ -44,10 +44,9 @@ import (
 // newPersistentQueueFallbackTest builds a config with a persistent sending queue
 // (sending_queue.storage) and the feature gate off, plus a bulk-recording server
 // and a host exposing the storage extension. In this mode every signal's exporter
-// must fall back to the legacy pdata-based request (which the persistent queue can
-// marshal to disk) instead of the ingest-time-encoding request path (whose custom
-// request type is not marshalable). Without the fallback the exporter would fail
-// to persist requests.
+// must wrap raw pdata at ingest (pdataRequest) so the persistent queue keeps the
+// legacy pdata on-disk format, then encode on drain — end to end, documents must
+// still be delivered.
 func newPersistentQueueFallbackTest(t *testing.T) (*Config, component.Host, *bulkRecorder) {
 	rec := newBulkRecorder()
 	server := newESTestServer(t, func(docs []itemRequest) ([]itemResponse, error) {
@@ -429,6 +428,106 @@ func TestNewLogsRequestConverter_SendsGoodRecordsDespitePerRecordErrors(t *testi
 	req, err := newEncodedConverter(exp, stub)(context.Background(), plog.NewLogs())
 	require.NoError(t, err)
 	require.Equal(t, 2, req.(*encodedRequest).ItemsCount())
+}
+
+// newPdataLogsConverter mirrors the factory's gate-off wiring for logs.
+func newPdataLogsConverter(e *elasticsearchExporter) xexporterhelper.RequestConverterFunc[plog.Logs] {
+	return newPdataConverter(e, e.encodeLogRecords,
+		plog.Logs.LogRecordCount, (&plog.ProtoMarshaler{}).LogsSize, pdatareq.MarshalLogs)
+}
+
+func TestPdataRequest_SizesAndPush(t *testing.T) {
+	var flushed atomic.Int64
+	server := newBenchESServer(t, &flushed)
+	exp := newBenchLogsExporter(t, server.URL)
+
+	ld := benchLogs(3)
+	req, err := newPdataLogsConverter(exp)(context.Background(), ld)
+	require.NoError(t, err)
+
+	require.Equal(t, 3, req.ItemsCount())
+	require.Equal(t, (&plog.ProtoMarshaler{}).LogsSize(ld), req.BytesSize())
+
+	// pushEncodedRequest must accept an unconverted pdataRequest (it can reach
+	// the consumer when the persistent queue's marshal round-trip is bypassed)
+	// and deliver its documents.
+	require.NoError(t, exp.pushEncodedRequest(context.Background(), req))
+	require.Equal(t, int64(3), flushed.Load())
+}
+
+func TestPdataRequest_MergeSplitConverts(t *testing.T) {
+	server := newBenchESServer(t, nil)
+	exp := newBenchLogsExporter(t, server.URL)
+	conv := newPdataLogsConverter(exp)
+
+	a, err := conv(context.Background(), benchLogs(2))
+	require.NoError(t, err)
+	b, err := conv(context.Background(), benchLogs(3))
+	require.NoError(t, err)
+
+	// pdata + pdata: both sides are converted and merged into an encodedRequest.
+	reqs, err := a.MergeSplit(context.Background(), 0, exporterhelper.RequestSizerTypeItems, b)
+	require.NoError(t, err)
+	require.Len(t, reqs, 1)
+	require.IsType(t, &encodedRequest{}, reqs[0])
+	require.Equal(t, 5, reqs[0].ItemsCount())
+
+	// encoded + pdata: an encodedRequest retained by the batcher must accept a
+	// pdataRequest as the incoming request.
+	encReq, err := newEncodedConverter(exp, exp.encodeLogRecords)(context.Background(), benchLogs(1))
+	require.NoError(t, err)
+	c, err := conv(context.Background(), benchLogs(2))
+	require.NoError(t, err)
+	reqs, err = encReq.MergeSplit(context.Background(), 0, exporterhelper.RequestSizerTypeItems, c)
+	require.NoError(t, err)
+	require.Len(t, reqs, 1)
+	require.Equal(t, 3, reqs[0].ItemsCount())
+}
+
+func TestGateOffEncoding_WritesLegacyReadsBoth(t *testing.T) {
+	// With the feature gate off (the default) and a persistent queue, the
+	// factory installs the same polymorphic Encoding as with the gate on: the
+	// gate only controls the ingest-time write format. Writes go out in the
+	// legacy pdata format (downgrade-safe), while reads handle both that format
+	// and early-encoded payloads left over from when the gate was on — so
+	// toggling the gate off never strands queued data.
+	server := newBenchESServer(t, nil)
+	exp := newBenchLogsExporter(t, server.URL)
+
+	storageID := component.MustNewID("file_storage")
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoints = []string{server.URL}
+		cfg.QueueBatchConfig.Get().StorageID = &storageID
+	})
+	require.False(t, useEarlyEncoding(cfg)) // persistent queue, gate off
+
+	qbs := requestQueueBatchSettings(cfg, newEncodedConverter(exp, exp.encodeLogRecords),
+		pdatareq.UnmarshalLogs, (&plog.ProtoUnmarshaler{}).UnmarshalLogs)
+	enc := qbs.Encoding.(encodedEncoding[plog.Logs])
+
+	// Ingest-side write: a pdataRequest marshals to the legacy pdata format...
+	pReq, err := newPdataLogsConverter(exp)(context.Background(), benchLogs(2))
+	require.NoError(t, err)
+	legacyBytes, err := enc.Marshal(context.Background(), pReq)
+	require.NoError(t, err)
+	require.NotEqual(t, earlyEncodedMagic, legacyBytes[0])
+
+	// ...and reads back as a fully encoded request.
+	_, req, err := enc.Unmarshal(legacyBytes)
+	require.NoError(t, err)
+	require.Equal(t, 2, req.(*encodedRequest).ItemsCount())
+
+	// A leftover early-encoded payload (written while the gate was on) is also
+	// read, even though the gate is off.
+	earlyReq, err := newEncodedConverter(exp, exp.encodeLogRecords)(context.Background(), benchLogs(3))
+	require.NoError(t, err)
+	earlyBytes, err := enc.Marshal(context.Background(), earlyReq)
+	require.NoError(t, err)
+	require.Equal(t, earlyEncodedMagic, earlyBytes[0])
+
+	_, req, err = enc.Unmarshal(earlyBytes)
+	require.NoError(t, err)
+	require.Equal(t, 3, req.(*encodedRequest).ItemsCount())
 }
 
 func TestPushLogsRequest_WrongType(t *testing.T) {

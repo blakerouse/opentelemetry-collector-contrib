@@ -644,28 +644,18 @@ processors:
 
 - Stability: alpha (disabled by default)
 
-For every signal (logs, metrics, traces and profiles) the exporter serializes each
-record to its final Elasticsearch bulk item at ingest time ("early encoding"), on
-the `ConsumeX` caller goroutines, so the sending-queue consumer only assembles and
-sends already-encoded bytes. This is always used with the in-memory sending queue.
+The exporter encodes each record to its final Elasticsearch bulk item at ingest
+time ("early encoding"). By default a persistent sending queue
+(`sending_queue.storage`) still stores pdata; enabling this gate stores the
+already-encoded bulk items instead.
 
-When a persistent sending queue is configured (`sending_queue.storage`), early
-encoding is off by default and the exporter stores pdata in the queue, serializing
-on the consumer goroutine instead. Enabling this feature gate makes the exporter
-perform early encoding with the persistent queue as well, storing the
-already-encoded bulk items in the queue.
+The gate only affects the format written to the queue. Both formats are always
+readable on drain, so toggling the gate never requires draining the queue — only
+downgrading to a collector version without this support does.
 
-On drain the exporter reads both the early-encoded format and any pdata payloads
-left in the queue by a previous version, so the gate can be enabled during an
-upgrade without draining the queue first. Note that this changes the on-disk queue
-format: after the gate has been enabled, **downgrading** to a version without it
-requires draining the persistent queue first, because the older version cannot
-read early-encoded entries.
-
-The gate has no effect when `sending_queue.storage` is not set, or when
-`metadata_keys`-based partitioning is configured (the early-encoded format does not
-carry the request context that partitioning needs on drain, so the exporter keeps
-using the pdata path in that case).
+The gate has no effect without `sending_queue.storage`, or when `metadata_keys`
+is configured (the early-encoded format does not carry the request context that
+partitioning needs).
 
 ## Known issues
 

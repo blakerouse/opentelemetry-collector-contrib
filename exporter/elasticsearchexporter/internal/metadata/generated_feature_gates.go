@@ -9,7 +9,7 @@ import (
 var ExporterElasticsearchEarlyEncodingWithPersistentQueueFeatureGate = featuregate.GlobalRegistry().MustRegister(
 	"exporter.elasticsearch.earlyEncodingWithPersistentQueue",
 	featuregate.StageAlpha,
-	featuregate.WithRegisterDescription("When enabled, the Elasticsearch exporter performs ingest-time (early) encoding of records even when a persistent sending queue (sending_queue.storage) is configured, storing already-encoded bulk items in the queue. On drain both early-encoded and legacy pdata payloads are supported, so the gate can be enabled on upgrade without draining the queue; only downgrades require draining. Not used when metadata_keys partitioning is configured, because the early-encoded format does not carry the request context."),
+	featuregate.WithRegisterDescription("When enabled, the exporter encodes records at ingest time and stores the already-encoded bulk items in the persistent sending queue (sending_queue.storage) instead of pdata. Only the written format is affected; both formats are always readable on drain, so toggling the gate never requires draining the queue — only downgrading the collector does. No effect without a persistent queue or when metadata_keys is configured."),
 	featuregate.WithRegisterReferenceURL("https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/49835"),
 	featuregate.WithRegisterFromVersion("v0.158.0"),
 )

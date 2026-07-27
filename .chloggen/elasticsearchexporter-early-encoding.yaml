@@ -17,10 +17,10 @@ issues: [49835]
 # Use pipe (|) for multiline entries.
 subtext: |
   Early encoding moves per-record JSON serialization off the sending-queue consumer's critical path,
-  improving throughput and making the byte sizer O(1). It is always used with the in-memory queue. With a
-  persistent queue (sending_queue.storage) it is opt-in behind the feature gate, since it changes the
-  on-disk queue format. On drain the exporter reads both early-encoded and legacy pdata payloads, so the
-  gate can be enabled on upgrade without draining the queue; only downgrades require draining first.
+  improving throughput and making the byte sizer O(1). With a persistent queue (sending_queue.storage),
+  storing the encoded format is opt-in behind the feature gate. The gate only affects the written format;
+  both formats are always readable on drain, so toggling it never requires draining the queue — only
+  downgrading the collector does.
 
 # If your change doesn't affect end users or the exported elements of any package,
 # you should instead start your pull request title with [chore] or use the "Skip Changelog" label.

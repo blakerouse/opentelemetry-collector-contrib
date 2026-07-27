@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/xexporterhelper"
@@ -92,7 +93,7 @@ func (r *encodedRequest) BytesSize() int { return r.bytesSize }
 // interface contract, the last returned Request is guaranteed to be the
 // smallest.
 func (r *encodedRequest) MergeSplit(
-	_ context.Context,
+	ctx context.Context,
 	maxSize int,
 	sizerType exporterhelper.RequestSizerType,
 	req xexporterhelper.Request,
@@ -101,7 +102,16 @@ func (r *encodedRequest) MergeSplit(
 	if req != nil {
 		other, ok := req.(*encodedRequest)
 		if !ok {
-			return nil, errors.New("elasticsearchexporter: MergeSplit got incompatible Request type")
+			// A pdataRequest can reach the batcher unconverted when the
+			// persistent queue's marshal round-trip is bypassed; convert it here.
+			conv, isEncodable := req.(encodableRequest)
+			if !isEncodable {
+				return nil, errors.New("elasticsearchexporter: MergeSplit got incompatible Request type")
+			}
+			var err error
+			if other, err = conv.toEncoded(ctx); err != nil {
+				return nil, err
+			}
 		}
 		merged = append(merged, other.items...)
 	}
@@ -199,46 +209,146 @@ func splitByCount(items []encodedItem, maxCount int) []xexporterhelper.Request {
 // whole batch (e.g. mapping-mode resolution failure).
 type recordEncoder[T any] func(ctx context.Context, data T) (items []encodedItem, perRecordErrs []error, err error)
 
+// convertToEncoded encodes data into an *encodedRequest, dropping (and logging
+// and counting) records that fail to encode. A non-nil error means the whole
+// payload failed (e.g. mapping-mode resolution); any consumererror permanent
+// wrapper is preserved.
+func convertToEncoded[T any](ctx context.Context, e *elasticsearchExporter, encode recordEncoder[T], data T) (*encodedRequest, error) {
+	items, perRecordErrs, err := encode(ctx, data)
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
+		return nil, err
+	}
+	if len(perRecordErrs) > 0 {
+		// Per-record encoding failures are deterministic, so retrying cannot
+		// fix them, and returning an error here would make exporterhelper
+		// drop the whole request, including the successfully encoded records.
+		// Send what we can instead: drop only the failed records, logging
+		// them and counting them as failed_client documents.
+		e.set.Logger.Warn("dropping records that failed to encode",
+			zap.Int("dropped_records", len(perRecordErrs)),
+			zap.Error(errors.Join(perRecordErrs...)))
+		e.telemetryBuilder.ElasticsearchDocsProcessed.Add(ctx, int64(len(perRecordErrs)),
+			metric.WithAttributeSet(attribute.NewSet(append(
+				getAttributesFromMetadataKeys(ctx, e.config.MetadataKeys),
+				withOutcome("failed_client"),
+			)...)))
+	}
+	return newEncodedRequest(items), nil
+}
+
 // newEncodedConverter adapts a per-signal recordEncoder into the exporterhelper
 // RequestConverterFunc used by the request-based API. It runs on the ConsumeX
 // caller goroutines.
 func newEncodedConverter[T any](e *elasticsearchExporter, encode recordEncoder[T]) xexporterhelper.RequestConverterFunc[T] {
 	return func(ctx context.Context, data T) (xexporterhelper.Request, error) {
-		items, perRecordErrs, err := encode(ctx, data)
+		r, err := convertToEncoded(ctx, e, encode, data)
 		if err != nil {
-			if cerr := ctx.Err(); cerr != nil {
-				return nil, cerr
-			}
 			// The request-converter path re-wraps any error as permanent; unwrap
 			// so the surfaced message matches the legacy push path.
 			return nil, unwrapPermanent(err)
 		}
-		if len(perRecordErrs) > 0 {
-			// Per-record encoding failures are deterministic, so retrying cannot
-			// fix them, and returning an error here would make exporterhelper
-			// drop the whole request, including the successfully encoded records.
-			// Send what we can instead: drop only the failed records, logging
-			// them and counting them as failed_client documents.
-			e.set.Logger.Warn("dropping records that failed to encode",
-				zap.Int("dropped_records", len(perRecordErrs)),
-				zap.Error(errors.Join(perRecordErrs...)))
-			e.telemetryBuilder.ElasticsearchDocsProcessed.Add(ctx, int64(len(perRecordErrs)),
-				metric.WithAttributeSet(attribute.NewSet(append(
-					getAttributesFromMetadataKeys(ctx, e.config.MetadataKeys),
-					withOutcome("failed_client"),
-				)...)))
-		}
-		return newEncodedRequest(items), nil
+		return r, nil
 	}
+}
+
+// pdataRequest wraps a not-yet-encoded pdata payload so the persistent queue
+// can keep the legacy pdata on-disk format (feature gate off, or metadata_keys
+// configured). It normally lives only between ConsumeX and the queue's Marshal;
+// Unmarshal returns an *encodedRequest, encoding on the consumer goroutine like
+// the legacy path. MergeSplit and pushEncodedRequest still accept it, converting
+// on the spot, for configurations that bypass the marshal round-trip.
+type pdataRequest[T any] struct {
+	data    T
+	e       *elasticsearchExporter
+	encode  recordEncoder[T]
+	items   int
+	size    func() int
+	marshal func(context.Context, T) ([]byte, error)
+}
+
+var (
+	_ xexporterhelper.Request = (*pdataRequest[any])(nil)
+	_ encodableRequest        = (*pdataRequest[any])(nil)
+)
+
+// encodableRequest is implemented by requests that can convert themselves into
+// an *encodedRequest on demand.
+type encodableRequest interface {
+	toEncoded(ctx context.Context) (*encodedRequest, error)
+}
+
+// newPdataConverter builds the ingest-time converter for the legacy-format
+// path: it wraps the pdata payload without encoding it. itemsCount and
+// bytesSize report the payload's record count and proto size for the queue
+// sizers; marshal writes the legacy pdatareq on-disk format.
+func newPdataConverter[T any](
+	e *elasticsearchExporter,
+	encode recordEncoder[T],
+	itemsCount func(T) int,
+	bytesSize func(T) int,
+	marshal func(context.Context, T) ([]byte, error),
+) xexporterhelper.RequestConverterFunc[T] {
+	return func(_ context.Context, data T) (xexporterhelper.Request, error) {
+		return &pdataRequest[T]{
+			data:    data,
+			e:       e,
+			encode:  encode,
+			items:   itemsCount(data),
+			size:    sync.OnceValue(func() int { return bytesSize(data) }),
+			marshal: marshal,
+		}, nil
+	}
+}
+
+func (r *pdataRequest[T]) ItemsCount() int { return r.items }
+
+func (r *pdataRequest[T]) BytesSize() int { return r.size() }
+
+func (r *pdataRequest[T]) toEncoded(ctx context.Context) (*encodedRequest, error) {
+	return convertToEncoded(ctx, r.e, r.encode, r.data)
+}
+
+// MergeSplit converts the payload to an *encodedRequest (and other too, if it
+// is also a pdataRequest) and delegates. It is only reached when a pdataRequest
+// bypasses the persistent queue's marshal round-trip.
+func (r *pdataRequest[T]) MergeSplit(
+	ctx context.Context,
+	maxSize int,
+	sizerType exporterhelper.RequestSizerType,
+	req xexporterhelper.Request,
+) ([]xexporterhelper.Request, error) {
+	enc, err := r.toEncoded(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if other, ok := req.(encodableRequest); ok {
+		req, err = other.toEncoded(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return enc.MergeSplit(ctx, maxSize, sizerType, req)
 }
 
 // pushEncodedRequest is the request consumer (runs on the sending-queue consumer
 // goroutines). It assembles the pre-encoded bulk items into bulk indexer
-// sessions and flushes them. No serialization happens here.
+// sessions and flushes them. Normally no serialization happens here; a
+// pdataRequest that bypassed the persistent queue's marshal round-trip is
+// converted on the spot (matching the legacy encode-on-consumer profile).
 func (e *elasticsearchExporter) pushEncodedRequest(ctx context.Context, req xexporterhelper.Request) error {
 	r, ok := req.(*encodedRequest)
 	if !ok {
-		return fmt.Errorf("elasticsearchexporter: pushEncodedRequest got %T, expected *encodedRequest", req)
+		conv, isEncodable := req.(encodableRequest)
+		if !isEncodable {
+			return fmt.Errorf("elasticsearchexporter: pushEncodedRequest got %T, expected *encodedRequest", req)
+		}
+		var err error
+		if r, err = conv.toEncoded(ctx); err != nil {
+			return err
+		}
 	}
 	return e.consumeEncodedItems(ctx, r.items)
 }
@@ -401,10 +511,12 @@ func (s *itemSink) add(_ context.Context, item encodedItem, doc encodedDoc) erro
 }
 
 // useEarlyEncoding reports whether the exporter should serialize each record at
-// ingest time (the request path) rather than on the sending-queue consumer (the
-// legacy pdata path). Early encoding is always used unless a persistent sending
-// queue (sending_queue.storage) is configured, in which case it additionally
-// requires the feature gate and the absence of metadata_keys partitioning (the
+// ingest time. It only controls the ingest side — what the request carries and,
+// with a persistent queue, which format is written to disk (early-encoded vs
+// legacy pdata). Draining is unaffected: encodedEncoding.Unmarshal always reads
+// both formats. Early encoding is always used unless a persistent sending queue
+// (sending_queue.storage) is configured, in which case it additionally requires
+// the feature gate and the absence of metadata_keys partitioning (the
 // early-encoded on-disk format does not carry the request context that
 // partitioning needs on drain).
 func useEarlyEncoding(cf *Config) bool {
@@ -442,12 +554,17 @@ type encodedEncoding[T any] struct {
 	unmarshalPlain func([]byte) (T, error)                  // e.g. (&plog.ProtoUnmarshaler{}).UnmarshalLogs
 }
 
-func (encodedEncoding[T]) Marshal(_ context.Context, req xexporterhelper.Request) ([]byte, error) {
-	r, ok := req.(*encodedRequest)
-	if !ok {
-		return nil, fmt.Errorf("elasticsearchexporter: encodedEncoding.Marshal got %T, expected *encodedRequest", req)
+func (encodedEncoding[T]) Marshal(ctx context.Context, req xexporterhelper.Request) ([]byte, error) {
+	switch r := req.(type) {
+	case *encodedRequest:
+		return marshalEncodedRequest(r), nil
+	case *pdataRequest[T]:
+		// Legacy pdata on-disk format (gate off or metadata_keys configured):
+		// keeps the queue readable by older collector versions.
+		return r.marshal(ctx, r.data)
+	default:
+		return nil, fmt.Errorf("elasticsearchexporter: encodedEncoding.Marshal got %T, expected *encodedRequest or *pdataRequest", req)
 	}
-	return marshalEncodedRequest(r), nil
 }
 
 func (enc encodedEncoding[T]) Unmarshal(b []byte) (context.Context, xexporterhelper.Request, error) {

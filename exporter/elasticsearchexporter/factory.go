@@ -95,11 +95,13 @@ func createDefaultConfig() component.Config {
 	}
 }
 
-// Every signal follows the same shape: when useEarlyEncoding is true (the
-// default; see encoded.go) each record is serialized at ingest via the
-// request-based API (NewXRequest + newEncodedConverter + pushEncodedRequest);
-// otherwise the exporter falls back to the legacy pdata path (NewX + pushXData),
-// which serializes on the sending-queue consumer and stores pdata in the queue.
+// Every signal follows the same request-based shape (NewXRequest +
+// pushEncodedRequest). useEarlyEncoding (see encoded.go) only selects the
+// ingest-time converter: newEncodedConverter serializes each record at ingest
+// (and, with a persistent queue, stores the early-encoded format on disk),
+// while newPdataConverter wraps the raw pdata so the persistent queue keeps
+// the legacy pdata on-disk format and records are encoded on the consumer
+// goroutine at drain. Draining always reads both formats.
 
 // createLogsExporter creates a new exporter for logs.
 //
@@ -118,14 +120,14 @@ func createLogsExporter(
 		return nil, err
 	}
 
-	if useEarlyEncoding(cf) {
-		converter := newEncodedConverter(exp, exp.encodeLogRecords)
-		qbs := earlyEncodingQueueBatchSettings(cf, converter, pdatareq.UnmarshalLogs, (&plog.ProtoUnmarshaler{}).UnmarshalLogs)
-		return xexporterhelper.NewLogsRequest(ctx, set, converter, exp.pushEncodedRequest,
-			exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
+	qbs := requestQueueBatchSettings(cf, newEncodedConverter(exp, exp.encodeLogRecords),
+		pdatareq.UnmarshalLogs, (&plog.ProtoUnmarshaler{}).UnmarshalLogs)
+	converter := newEncodedConverter(exp, exp.encodeLogRecords)
+	if !useEarlyEncoding(cf) {
+		converter = newPdataConverter(exp, exp.encodeLogRecords,
+			plog.Logs.LogRecordCount, (&plog.ProtoMarshaler{}).LogsSize, pdatareq.MarshalLogs)
 	}
-	qbs := legacyQueueBatchSettings(cf, xexporterhelper.NewLogsQueueBatchSettings())
-	return exporterhelper.NewLogs(ctx, set, cfg, exp.pushLogsData,
+	return xexporterhelper.NewLogsRequest(ctx, set, converter, exp.pushEncodedRequest,
 		exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
 }
 
@@ -143,14 +145,14 @@ func createMetricsExporter(
 		return nil, err
 	}
 
-	if useEarlyEncoding(cf) {
-		converter := newEncodedConverter(exp, exp.encodeMetricRecords)
-		qbs := earlyEncodingQueueBatchSettings(cf, converter, pdatareq.UnmarshalMetrics, (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics)
-		return xexporterhelper.NewMetricsRequest(ctx, set, converter, exp.pushEncodedRequest,
-			exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
+	qbs := requestQueueBatchSettings(cf, newEncodedConverter(exp, exp.encodeMetricRecords),
+		pdatareq.UnmarshalMetrics, (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics)
+	converter := newEncodedConverter(exp, exp.encodeMetricRecords)
+	if !useEarlyEncoding(cf) {
+		converter = newPdataConverter(exp, exp.encodeMetricRecords,
+			pmetric.Metrics.DataPointCount, (&pmetric.ProtoMarshaler{}).MetricsSize, pdatareq.MarshalMetrics)
 	}
-	qbs := legacyQueueBatchSettings(cf, xexporterhelper.NewMetricsQueueBatchSettings())
-	return exporterhelper.NewMetrics(ctx, set, cfg, exp.pushMetricsData,
+	return xexporterhelper.NewMetricsRequest(ctx, set, converter, exp.pushEncodedRequest,
 		exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
 }
 
@@ -167,14 +169,14 @@ func createTracesExporter(ctx context.Context,
 		return nil, err
 	}
 
-	if useEarlyEncoding(cf) {
-		converter := newEncodedConverter(exp, exp.encodeTraceRecords)
-		qbs := earlyEncodingQueueBatchSettings(cf, converter, pdatareq.UnmarshalTraces, (&ptrace.ProtoUnmarshaler{}).UnmarshalTraces)
-		return xexporterhelper.NewTracesRequest(ctx, set, converter, exp.pushEncodedRequest,
-			exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
+	qbs := requestQueueBatchSettings(cf, newEncodedConverter(exp, exp.encodeTraceRecords),
+		pdatareq.UnmarshalTraces, (&ptrace.ProtoUnmarshaler{}).UnmarshalTraces)
+	converter := newEncodedConverter(exp, exp.encodeTraceRecords)
+	if !useEarlyEncoding(cf) {
+		converter = newPdataConverter(exp, exp.encodeTraceRecords,
+			ptrace.Traces.SpanCount, (&ptrace.ProtoMarshaler{}).TracesSize, pdatareq.MarshalTraces)
 	}
-	qbs := legacyQueueBatchSettings(cf, xexporterhelper.NewTracesQueueBatchSettings())
-	return exporterhelper.NewTraces(ctx, set, cfg, exp.pushTraceData,
+	return xexporterhelper.NewTracesRequest(ctx, set, converter, exp.pushEncodedRequest,
 		exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
 }
 
@@ -195,22 +197,24 @@ func createProfilesExporter(
 		return nil, err
 	}
 
-	if useEarlyEncoding(cf) {
-		converter := newEncodedConverter(exp, exp.encodeProfileRecords)
-		qbs := earlyEncodingQueueBatchSettings(cf, converter, pdatareq.UnmarshalProfiles, (&pprofile.ProtoUnmarshaler{}).UnmarshalProfiles)
-		return xexporterhelper.NewProfilesRequest(ctx, set, converter, exp.pushEncodedRequest,
-			exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
+	qbs := requestQueueBatchSettings(cf, newEncodedConverter(exp, exp.encodeProfileRecords),
+		pdatareq.UnmarshalProfiles, (&pprofile.ProtoUnmarshaler{}).UnmarshalProfiles)
+	converter := newEncodedConverter(exp, exp.encodeProfileRecords)
+	if !useEarlyEncoding(cf) {
+		converter = newPdataConverter(exp, exp.encodeProfileRecords,
+			pprofile.Profiles.SampleCount, (&pprofile.ProtoMarshaler{}).ProfilesSize, pdatareq.MarshalProfiles)
 	}
-	qbs := legacyQueueBatchSettings(cf, xexporterhelper.NewProfilesQueueBatchSettings())
-	return xexporterhelper.NewProfiles(ctx, set, cfg, exp.pushProfilesData,
+	return xexporterhelper.NewProfilesRequest(ctx, set, converter, exp.pushEncodedRequest,
 		exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
 }
 
-// earlyEncodingQueueBatchSettings builds the QueueBatchSettings for the
-// request-based (early encoding) path. When a persistent sending queue is
-// configured it installs the custom Encoding so requests can be marshaled to
-// disk (and legacy pdata payloads still read back); see encoded.go.
-func earlyEncodingQueueBatchSettings[T any](
+// requestQueueBatchSettings builds the QueueBatchSettings for the request-based
+// pipeline. When a persistent sending queue is configured it installs the
+// custom Encoding, which marshals early-encoded requests to the compact wire
+// format and pdata-wrapping requests to the legacy pdata format, and on
+// Unmarshal transparently reads both; see encoded.go. converter is the
+// early-encoding converter used to re-encode pdata payloads on drain.
+func requestQueueBatchSettings[T any](
 	cf *Config,
 	converter xexporterhelper.RequestConverterFunc[T],
 	unmarshalCtx func([]byte) (context.Context, T, error),
@@ -224,13 +228,6 @@ func earlyEncodingQueueBatchSettings[T any](
 			unmarshalPlain: unmarshalPlain,
 		}
 	}
-	applyMetadataPartitioner(cf, &qbs)
-	return qbs
-}
-
-// legacyQueueBatchSettings augments the signal's built-in pdata QueueBatchSettings
-// with metadata_keys partitioning if configured.
-func legacyQueueBatchSettings(cf *Config, qbs xexporterhelper.QueueBatchSettings) xexporterhelper.QueueBatchSettings {
 	applyMetadataPartitioner(cf, &qbs)
 	return qbs
 }
