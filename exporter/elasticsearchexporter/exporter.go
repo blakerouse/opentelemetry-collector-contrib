@@ -151,8 +151,8 @@ func (e *elasticsearchExporter) encodeLogRecords(ctx context.Context, ld plog.Lo
 }
 
 // emitLogs iterates ld, encoding each log record and handing it to sink.
-// perRecordErrs are deterministic per-record errors that both the streamed and
-// ingest paths return to the caller; a returned error aborts the whole batch.
+// perRecordErrs are deterministic per-record errors; see recordEncoder for how
+// each path handles them. A returned error aborts the whole batch.
 func (e *elasticsearchExporter) emitLogs(ctx context.Context, sink docSink, ld plog.Logs) ([]error, error) {
 	defaultMappingMode, err := e.getRequestMappingMode(ctx)
 	if err != nil {

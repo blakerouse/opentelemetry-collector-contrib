@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -385,10 +386,12 @@ func TestSplitDoesNotAliasSiblings(t *testing.T) {
 	})
 }
 
-func TestNewLogsRequestConverter_PerRecordErrorsAreReturned(t *testing.T) {
-	// An invalid Logstash date format makes routing fail for every record. The
-	// converter must surface those deterministic per-record errors to the caller
-	// rather than dropping the records silently, and produce no request.
+func TestNewLogsRequestConverter_PerRecordErrorsDropOnlyFailedRecords(t *testing.T) {
+	// An invalid Logstash date format makes routing fail for every record.
+	// Per-record encoding failures are deterministic, so the converter must not
+	// fail the conversion (which would drop the whole batch): it drops the
+	// failed records, logging and counting them, and still returns a request
+	// with whatever encoded successfully — here, nothing.
 	cfg := withDefaultConfig(func(cfg *Config) {
 		cfg.Endpoints = []string{"http://localhost:9200"}
 		cfg.Mapping.Mode = "otel"
@@ -402,8 +405,30 @@ func TestNewLogsRequestConverter_PerRecordErrorsAreReturned(t *testing.T) {
 	require.NoError(t, err)
 
 	req, err := newEncodedConverter(exp, exp.encodeLogRecords)(context.Background(), benchLogs(3))
-	require.Error(t, err)
-	require.Nil(t, req)
+	require.NoError(t, err)
+	require.Equal(t, 0, req.(*encodedRequest).ItemsCount())
+}
+
+func TestNewLogsRequestConverter_SendsGoodRecordsDespitePerRecordErrors(t *testing.T) {
+	// When only some records fail to encode, the converter must return a
+	// request containing the records that encoded successfully rather than
+	// sacrificing them for the failed ones.
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoints = []string{"http://localhost:9200"}
+	})
+	exp, err := newExporter(cfg, exportertest.NewNopSettings(metadata.Type), cfg.LogsIndex)
+	require.NoError(t, err)
+
+	stub := func(context.Context, plog.Logs) ([]encodedItem, []error, error) {
+		items := []encodedItem{
+			{index: "logs-generic", action: "create", doc: []byte(`{"a":1}`)},
+			{index: "logs-generic", action: "create", doc: []byte(`{"b":2}`)},
+		}
+		return items, []error{errors.New("record 3 failed to encode")}, nil
+	}
+	req, err := newEncodedConverter(exp, stub)(context.Background(), plog.NewLogs())
+	require.NoError(t, err)
+	require.Equal(t, 2, req.(*encodedRequest).ItemsCount())
 }
 
 func TestPushLogsRequest_WrongType(t *testing.T) {

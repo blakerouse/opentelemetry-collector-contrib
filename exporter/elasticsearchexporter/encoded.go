@@ -14,6 +14,9 @@ import (
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/xexporterhelper"
 	pdatareq "go.opentelemetry.io/collector/pdata/xpdata/request"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/metadata"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/pool"
@@ -190,14 +193,16 @@ func splitByCount(items []encodedItem, maxCount int) []xexporterhelper.Request {
 
 // recordEncoder serializes one pdata payload (plog.Logs, pmetric.Metrics, ...)
 // into encoded bulk items at ingest time. perRecordErrs are deterministic
-// per-record encoding errors that both paths return to the caller; a non-nil err
-// aborts the whole batch (e.g. mapping-mode resolution failure).
+// per-record encoding errors: the legacy push path returns them to the caller
+// after flushing, while the converter path drops only the failed records
+// (logging and counting them) and sends the rest. A non-nil err aborts the
+// whole batch (e.g. mapping-mode resolution failure).
 type recordEncoder[T any] func(ctx context.Context, data T) (items []encodedItem, perRecordErrs []error, err error)
 
 // newEncodedConverter adapts a per-signal recordEncoder into the exporterhelper
 // RequestConverterFunc used by the request-based API. It runs on the ConsumeX
 // caller goroutines.
-func newEncodedConverter[T any](_ *elasticsearchExporter, encode recordEncoder[T]) xexporterhelper.RequestConverterFunc[T] {
+func newEncodedConverter[T any](e *elasticsearchExporter, encode recordEncoder[T]) xexporterhelper.RequestConverterFunc[T] {
 	return func(ctx context.Context, data T) (xexporterhelper.Request, error) {
 		items, perRecordErrs, err := encode(ctx, data)
 		if err != nil {
@@ -209,12 +214,19 @@ func newEncodedConverter[T any](_ *elasticsearchExporter, encode recordEncoder[T
 			return nil, unwrapPermanent(err)
 		}
 		if len(perRecordErrs) > 0 {
-			// Surface deterministic per-record encoding failures to the caller
-			// rather than dropping the records silently. This matches the legacy
-			// push path, which returns the same errors. The request-converter path
-			// marks the returned error permanent, so exporterhelper does not retry
-			// these deterministic failures.
-			return nil, errors.Join(perRecordErrs...)
+			// Per-record encoding failures are deterministic, so retrying cannot
+			// fix them, and returning an error here would make exporterhelper
+			// drop the whole request, including the successfully encoded records.
+			// Send what we can instead: drop only the failed records, logging
+			// them and counting them as failed_client documents.
+			e.set.Logger.Warn("dropping records that failed to encode",
+				zap.Int("dropped_records", len(perRecordErrs)),
+				zap.Error(errors.Join(perRecordErrs...)))
+			e.telemetryBuilder.ElasticsearchDocsProcessed.Add(ctx, int64(len(perRecordErrs)),
+				metric.WithAttributeSet(attribute.NewSet(append(
+					getAttributesFromMetadataKeys(ctx, e.config.MetadataKeys),
+					withOutcome("failed_client"),
+				)...)))
 		}
 		return newEncodedRequest(items), nil
 	}
