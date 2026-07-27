@@ -1355,4 +1355,9 @@ func TestPersistedEnumValuesAreStable(t *testing.T) {
 	require.Equal(t, sessionTarget(3), targetProfilingStackFrames)
 	require.Equal(t, sessionTarget(4), targetProfilingExecutables)
 	require.Equal(t, sessionTarget(5), numSessionTargets)
+
+	require.Equal(t, itemKind(0), itemKindDoc)
+	require.Equal(t, itemKind(1), itemKindMergeableMetrics)
+	require.Equal(t, itemKind(2), itemKindDeferredMetrics)
+	require.Equal(t, itemKind(3), numItemKinds)
 }

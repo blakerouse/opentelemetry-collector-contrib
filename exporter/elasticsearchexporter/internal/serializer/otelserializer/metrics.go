@@ -16,9 +16,23 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/elasticsearch"
 )
 
-func (*Serializer) SerializeMetrics(resource pcommon.Resource, resourceSchemaURL string, scope pcommon.InstrumentationScope, scopeSchemaURL string, dataPoints []datapoints.DataPoint, validationErrors *[]error, idx elasticsearch.Index, buf *bytes.Buffer) (map[string]string, error) {
+// MetricsDocInfo describes the merge-relevant layout of a serialized metrics
+// document, allowing documents with the same group identity to be merged by
+// byte splicing after serialization (see AppendMergedMetricsTail). The zero
+// value means the document is not mergeable.
+type MetricsDocInfo struct {
+	// FragStart and FragEnd delimit the inner fields of the "metrics" object
+	// within the serialized document (without the surrounding braces).
+	FragStart, FragEnd int
+	// MetricNames are the metric names serialized into the document, sorted.
+	MetricNames []string
+	// DocCount is the document's _doc_count, 0 if absent.
+	DocCount uint64
+}
+
+func (*Serializer) SerializeMetrics(resource pcommon.Resource, resourceSchemaURL string, scope pcommon.InstrumentationScope, scopeSchemaURL string, dataPoints []datapoints.DataPoint, validationErrors *[]error, idx elasticsearch.Index, buf *bytes.Buffer) (map[string]string, MetricsDocInfo, error) {
 	if len(dataPoints) == 0 {
-		return nil, nil
+		return nil, MetricsDocInfo{}, nil
 	}
 	dp0 := dataPoints[0]
 
@@ -34,14 +48,15 @@ func (*Serializer) SerializeMetrics(resource pcommon.Resource, resourceSchemaURL
 	first = w.writeAttributes(dp0.Attributes(), true, first)
 	first = w.writeResource(resource, resourceSchemaURL, true, first)
 	first = w.writeScope(scope, scopeSchemaURL, true, first)
-	dynamicTemplates := serializeDataPoints(&w, dataPoints, validationErrors, first)
+	dynamicTemplates, info := serializeDataPoints(&w, dataPoints, validationErrors, first)
 	w.endObject()
-	return dynamicTemplates, nil
+	return dynamicTemplates, info, nil
 }
 
-func serializeDataPoints(w *jsonWriter, dataPoints []datapoints.DataPoint, validationErrors *[]error, first bool) map[string]string {
+func serializeDataPoints(w *jsonWriter, dataPoints []datapoints.DataPoint, validationErrors *[]error, first bool) (map[string]string, MetricsDocInfo) {
 	first = w.key("metrics", first)
 	w.startObject()
+	fragStart := w.buf.Len()
 
 	dynamicTemplates := make(map[string]string, len(dataPoints))
 	var docCount uint64
@@ -83,18 +98,44 @@ func serializeDataPoints(w *jsonWriter, dataPoints []datapoints.DataPoint, valid
 		// https://github.com/elastic/elasticsearch/blob/8.15/x-pack/plugin/core/template-resources/src/main/resources/metrics%40mappings.json
 		dynamicTemplates["metrics."+metric.Name()] = dp.DynamicTemplate(metric, datapoints.DynamicTemplateModeOTel)
 	}
+	fragEnd := w.buf.Len()
+	sort.Strings(metricNames)
+	writeMetricsTail(w, docCount, metricNames, first)
+
+	return dynamicTemplates, MetricsDocInfo{
+		FragStart:   fragStart,
+		FragEnd:     fragEnd,
+		MetricNames: metricNames,
+		DocCount:    docCount,
+	}
+}
+
+// writeMetricsTail closes the "metrics" object and writes the fields that
+// follow it: _doc_count (if non-zero) and _metric_names_hash. sortedNames must
+// be sorted. first refers to the document's top-level field state and is always
+// false in practice (@timestamp is written unconditionally).
+func writeMetricsTail(w *jsonWriter, docCount uint64, sortedNames []string, first bool) {
 	w.endObject()
 	if docCount != 0 {
 		first = w.writeUIntField("_doc_count", docCount, first)
 	}
-	sort.Strings(metricNames)
 	hasher := xxhash.New()
-	for _, name := range metricNames {
+	for _, name := range sortedNames {
 		_, _ = hasher.WriteString(name)
 	}
 	// workaround for https://github.com/elastic/elasticsearch/issues/99123
 	// should use a string field to benefit from run-length encoding
 	_ = w.writeStringFieldSkipDefault("_metric_names_hash", strconv.FormatUint(hasher.Sum64(), 16), first)
+}
 
-	return dynamicTemplates
+// AppendMergedMetricsTail appends the tail of a merged metrics document to buf,
+// following the last spliced "metrics" field: it closes the metrics object,
+// writes _doc_count (if non-zero) and _metric_names_hash, and closes the
+// document. sortedNames must be sorted; the output is byte-identical to the
+// tail SerializeMetrics produces for the same inputs, so a merged document has
+// the same TSDB identity as one serialized from the merged data points.
+func AppendMergedMetricsTail(buf *bytes.Buffer, docCount uint64, sortedNames []string) {
+	w := newJSONWriter(buf)
+	writeMetricsTail(&w, docCount, sortedNames, false)
+	w.endObject()
 }

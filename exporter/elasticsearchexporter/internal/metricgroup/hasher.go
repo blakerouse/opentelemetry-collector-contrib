@@ -21,6 +21,16 @@ type HashKey struct {
 	dpHash       uint64
 }
 
+// Uint64s returns the three hash components, for serialization.
+func (k HashKey) Uint64s() (resource, scope, dataPoint uint64) {
+	return k.resourceHash, k.scopeHash, k.dpHash
+}
+
+// NewHashKey reconstructs a HashKey from its serialized components.
+func NewHashKey(resource, scope, dataPoint uint64) HashKey {
+	return HashKey{resourceHash: resource, scopeHash: scope, dpHash: dataPoint}
+}
+
 // DataPointHasher is an interface for hashing data points by their identity,
 // for grouping into a single document.
 type DataPointHasher interface {

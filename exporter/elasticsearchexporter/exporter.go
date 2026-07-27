@@ -255,29 +255,94 @@ func (e *elasticsearchExporter) pushMetricsData(ctx context.Context, metrics pme
 
 func (e *elasticsearchExporter) encodeMetricRecords(ctx context.Context, metrics pmetric.Metrics) ([]encodedItem, []error, error) {
 	// The document count is the number of data point groups, not known until
-	// grouping completes inside emitMetrics, so no useful preallocation hint here.
-	return collectItems(ctx, e.emitMetrics, metrics, 0)
+	// grouping completes inside the emit, so no useful preallocation hint here.
+	sink := &itemSink{}
+	groups := newMetricsGroups()
+	excluded, defaultMode, err := e.collectMetricsGroups(ctx, groups, metrics, nil, func(m MappingMode) bool { return m != MappingECS })
+	if err != nil {
+		return nil, nil, err
+	}
+	perRecordErrs, err := e.emitMetricsGroups(ctx, sink, groups)
+	if err != nil {
+		return nil, nil, err
+	}
+	// ECS-mode scopes are deferred: their documents cannot be merged by byte
+	// splicing (the ECS serializer globally sorts and de-dots fields). The item
+	// holds the original payload by reference — no copy, no serialization — and
+	// records the request-default mapping mode; the consumer re-walks the
+	// payload with that default and encodes only the ECS-resolving scopes,
+	// grouped over the whole batch exactly like the legacy pdata path. Proto
+	// marshaling happens lazily, only if a persistent queue writes the item to
+	// disk. deferredSize is precomputed for the byte sizers (the legacy pdata
+	// path computed the same proto size for its default bytes-based batching).
+	if excluded {
+		sink.items = append(sink.items, encodedItem{
+			kind:            itemKindDeferredMetrics,
+			action:          docappender.ActionCreate,
+			mappingMode:     defaultMode,
+			target:          targetDefault,
+			deferredMetrics: metrics,
+			deferredSize:    (&pmetric.ProtoMarshaler{}).MetricsSize(metrics),
+		})
+	}
+	return sink.items, perRecordErrs, nil
 }
 
 // emitMetrics groups data points into documents, then encodes each group and
 // hands it to sink. Validation errors are logged (not returned) so upstream does
 // not retry; other per-record errors are returned via perRecordErrs.
 func (e *elasticsearchExporter) emitMetrics(ctx context.Context, sink docSink, metrics pmetric.Metrics) ([]error, error) {
-	defaultMappingMode, err := e.getRequestMappingMode(ctx)
-	if err != nil {
+	groups := newMetricsGroups()
+	if _, _, err := e.collectMetricsGroups(ctx, groups, metrics, nil, nil); err != nil {
 		return nil, err
 	}
+	return e.emitMetricsGroups(ctx, sink, groups)
+}
 
-	type mappingIndexKey struct {
-		mappingMode MappingMode
-		index       elasticsearch.Index
+// mappingIndexKey identifies a metric document group's routing.
+type mappingIndexKey struct {
+	mappingMode MappingMode
+	index       elasticsearch.Index
+}
+
+// metricsGroups accumulates metric data point groups across one or more
+// payloads. Groups hold references into the walked payloads; nothing is copied,
+// so the payloads must stay alive (and unmutated) until the groups are encoded.
+type metricsGroups struct {
+	// Maintain a 2 layer map to avoid storing lots of copies of index strings
+	byIndex map[mappingIndexKey]map[metricgroup.HashKey]*dataPointsGroup
+	// validationErrs are logged instead of returned so that upstream does not retry
+	validationErrs []error
+}
+
+func newMetricsGroups() *metricsGroups {
+	return &metricsGroups{byIndex: make(map[mappingIndexKey]map[metricgroup.HashKey]*dataPointsGroup)}
+}
+
+// collectMetricsGroups walks metrics and groups its data points into g,
+// resolving each scope's mapping mode from the scope attributes with
+// defaultMode as the fallback (when nil, the fallback is resolved from the
+// request context). Scopes whose resolved mode fails the include filter (nil
+// includes all) are skipped; the return values report whether any scope was
+// skipped and which fallback mode was used. The walk only reads metrics.
+func (e *elasticsearchExporter) collectMetricsGroups(
+	ctx context.Context,
+	g *metricsGroups,
+	metrics pmetric.Metrics,
+	defaultMode *MappingMode,
+	include func(MappingMode) bool,
+) (excluded bool, _ MappingMode, _ error) {
+	var defaultMappingMode MappingMode
+	if defaultMode != nil {
+		defaultMappingMode = *defaultMode
+	} else {
+		var err error
+		defaultMappingMode, err = e.getRequestMappingMode(ctx)
+		if err != nil {
+			return false, 0, err
+		}
 	}
 
-	// Maintain a 2 layer map to avoid storing lots of copies of index strings
-	groupedDataPointsByIndex := make(map[mappingIndexKey]map[metricgroup.HashKey]*dataPointsGroup)
-
-	var validationErrs []error // log instead of returning these so that upstream does not retry
-	var perRecordErrs []error
 	for _, resourceMetrics := range metrics.ResourceMetrics().All() {
 		resource := resourceMetrics.Resource()
 		var hasher metricgroup.DataPointHasher
@@ -286,7 +351,11 @@ func (e *elasticsearchExporter) emitMetrics(ctx context.Context, sink docSink, m
 			scope := scopeMetrics.Scope()
 			mappingMode, err := e.getScopeMappingMode(scope, defaultMappingMode)
 			if err != nil {
-				return nil, err
+				return false, 0, err
+			}
+			if include != nil && !include(mappingMode) {
+				excluded = true
+				continue
 			}
 			router := e.documentRouters[int(mappingMode)]
 			if hasher == nil || mappingMode != prevScopeMappingMode {
@@ -309,10 +378,10 @@ func (e *elasticsearchExporter) emitMetrics(ctx context.Context, sink docSink, m
 						mappingMode: mappingMode,
 						index:       index,
 					}
-					groupedDataPoints, ok := groupedDataPointsByIndex[key]
+					groupedDataPoints, ok := g.byIndex[key]
 					if !ok {
 						groupedDataPoints = make(map[metricgroup.HashKey]*dataPointsGroup)
-						groupedDataPointsByIndex[key] = groupedDataPoints
+						g.byIndex[key] = groupedDataPoints
 					}
 					hasher.UpdateDataPoint(dp)
 					hashKey := hasher.HashKey()
@@ -335,43 +404,43 @@ func (e *elasticsearchExporter) emitMetrics(ctx context.Context, sink docSink, m
 				case pmetric.MetricTypeSum:
 					for _, dp := range metric.Sum().DataPoints().All() {
 						if err := upsertDataPoint(datapoints.NewNumber(metric, dp)); err != nil {
-							validationErrs = append(validationErrs, err)
+							g.validationErrs = append(g.validationErrs, err)
 							continue
 						}
 					}
 				case pmetric.MetricTypeGauge:
 					for _, dp := range metric.Gauge().DataPoints().All() {
 						if err := upsertDataPoint(datapoints.NewNumber(metric, dp)); err != nil {
-							validationErrs = append(validationErrs, err)
+							g.validationErrs = append(g.validationErrs, err)
 							continue
 						}
 					}
 				case pmetric.MetricTypeExponentialHistogram:
 					if metric.ExponentialHistogram().AggregationTemporality() == pmetric.AggregationTemporalityCumulative {
-						validationErrs = append(validationErrs, fmt.Errorf("dropping cumulative temporality exponential histogram %q", metric.Name()))
+						g.validationErrs = append(g.validationErrs, fmt.Errorf("dropping cumulative temporality exponential histogram %q", metric.Name()))
 						continue
 					}
 					for _, dp := range metric.ExponentialHistogram().DataPoints().All() {
 						if err := upsertDataPoint(datapoints.NewExponentialHistogram(metric, dp)); err != nil {
-							validationErrs = append(validationErrs, err)
+							g.validationErrs = append(g.validationErrs, err)
 							continue
 						}
 					}
 				case pmetric.MetricTypeHistogram:
 					if metric.Histogram().AggregationTemporality() == pmetric.AggregationTemporalityCumulative {
-						validationErrs = append(validationErrs, fmt.Errorf("dropping cumulative temporality histogram %q", metric.Name()))
+						g.validationErrs = append(g.validationErrs, fmt.Errorf("dropping cumulative temporality histogram %q", metric.Name()))
 						continue
 					}
 					for _, dp := range metric.Histogram().DataPoints().All() {
 						if err := upsertDataPoint(datapoints.NewHistogram(metric, dp)); err != nil {
-							validationErrs = append(validationErrs, err)
+							g.validationErrs = append(g.validationErrs, err)
 							continue
 						}
 					}
 				case pmetric.MetricTypeSummary:
 					for _, dp := range metric.Summary().DataPoints().All() {
 						if err := upsertDataPoint(datapoints.NewSummary(metric, dp)); err != nil {
-							validationErrs = append(validationErrs, err)
+							g.validationErrs = append(g.validationErrs, err)
 							continue
 						}
 					}
@@ -380,11 +449,19 @@ func (e *elasticsearchExporter) emitMetrics(ctx context.Context, sink docSink, m
 		}
 	}
 
-	for key, groupedDataPoints := range groupedDataPointsByIndex {
-		for _, dpGroup := range groupedDataPoints {
+	return excluded, defaultMappingMode, nil
+}
+
+// emitMetricsGroups encodes every collected group and hands each document to
+// sink, returning deterministic per-record errors. It also logs the validation
+// errors accumulated during collection.
+func (e *elasticsearchExporter) emitMetricsGroups(ctx context.Context, sink docSink, g *metricsGroups) ([]error, error) {
+	var perRecordErrs []error
+	for key, groupedDataPoints := range g.byIndex {
+		for hashKey, dpGroup := range groupedDataPoints {
 			buf := e.bufferPool.NewPooledBuffer()
 			encoder := e.documentEncoders[int(key.mappingMode)]
-			dynamicTemplates, err := encoder.encodeMetrics(
+			dynamicTemplates, docInfo, err := encoder.encodeMetrics(
 				encodingContext{
 					resource:          dpGroup.resource,
 					resourceSchemaURL: dpGroup.resourceSchemaURL,
@@ -392,7 +469,7 @@ func (e *elasticsearchExporter) emitMetrics(ctx context.Context, sink docSink, m
 					scopeSchemaURL:    dpGroup.scopeSchemaURL,
 				},
 				dpGroup.dataPoints,
-				&validationErrs,
+				&g.validationErrs,
 				key.index,
 				buf.Buffer,
 			)
@@ -401,13 +478,25 @@ func (e *elasticsearchExporter) emitMetrics(ctx context.Context, sink docSink, m
 				perRecordErrs = append(perRecordErrs, err)
 				continue
 			}
-			if err := sink.add(ctx, encodedItem{
+			item := encodedItem{
 				index:            key.index.Index,
 				action:           docappender.ActionCreate,
 				dynamicTemplates: dynamicTemplates,
 				mappingMode:      key.mappingMode,
 				target:           targetDefault,
-			}, pooledDoc(buf)); err != nil {
+			}
+			// A non-zero FragStart marks a doc the encoder produced in a
+			// splice-mergeable layout (OTel mode); carry the merge metadata so
+			// the consumer can combine same-group docs across payloads.
+			if docInfo.FragStart > 0 {
+				item.kind = itemKindMergeableMetrics
+				item.groupKey = hashKey
+				item.fragStart = docInfo.FragStart
+				item.fragEnd = docInfo.FragEnd
+				item.metricNames = docInfo.MetricNames
+				item.docCount = docInfo.DocCount
+			}
+			if err := sink.add(ctx, item, pooledDoc(buf)); err != nil {
 				if cerr := ctx.Err(); cerr != nil {
 					return nil, cerr
 				}
@@ -415,8 +504,8 @@ func (e *elasticsearchExporter) emitMetrics(ctx context.Context, sink docSink, m
 			}
 		}
 	}
-	if len(validationErrs) > 0 {
-		e.set.Logger.Warn("validation errors", zap.Error(errors.Join(validationErrs...)))
+	if len(g.validationErrs) > 0 {
+		e.set.Logger.Warn("validation errors", zap.Error(errors.Join(g.validationErrs...)))
 	}
 	return perRecordErrs, nil
 }

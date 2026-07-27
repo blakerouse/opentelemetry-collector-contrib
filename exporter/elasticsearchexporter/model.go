@@ -156,7 +156,10 @@ type documentEncoder interface {
 	// should be written to. Encoders that do not produce a document return an empty buffer;
 	// encoders that need custom routing return a different index than the one passed in.
 	encodeSpanEvent(encodingContext, ptrace.Span, ptrace.SpanEvent, elasticsearch.Index, *bytes.Buffer) (elasticsearch.Index, error)
-	encodeMetrics(_ encodingContext, _ []datapoints.DataPoint, validationErrors *[]error, _ elasticsearch.Index, _ *bytes.Buffer) (map[string]string, error)
+	// encodeMetrics encodes a group of data points into a single document. The
+	// returned MetricsDocInfo is non-zero only for encoders whose documents can
+	// be merged by byte splicing (OTel mode); see otelserializer.MetricsDocInfo.
+	encodeMetrics(_ encodingContext, _ []datapoints.DataPoint, validationErrors *[]error, _ elasticsearch.Index, _ *bytes.Buffer) (map[string]string, otelserializer.MetricsDocInfo, error)
 	encodeProfile(_ encodingContext, _ pprofile.ProfilesDictionary, _ pprofile.Profile, _ func(*bytes.Buffer, string, string) error) error
 }
 
@@ -389,7 +392,7 @@ func (e otelModeEncoder) encodeMetrics(
 	validationErrors *[]error,
 	idx elasticsearch.Index,
 	buf *bytes.Buffer,
-) (map[string]string, error) {
+) (map[string]string, otelserializer.MetricsDocInfo, error) {
 	return e.serializer.SerializeMetrics(
 		ec.resource, ec.resourceSchemaURL,
 		ec.scope, ec.scopeSchemaURL,
@@ -439,8 +442,8 @@ func (e metricsUnsupportedEncoder) encodeMetrics(
 	_ *[]error,
 	_ elasticsearch.Index,
 	_ *bytes.Buffer,
-) (map[string]string, error) {
-	return nil, fmt.Errorf("mapping mode %q (%d) does not support metrics", e.mode, int(e.mode))
+) (map[string]string, otelserializer.MetricsDocInfo, error) {
+	return nil, otelserializer.MetricsDocInfo{}, fmt.Errorf("mapping mode %q (%d) does not support metrics", e.mode, int(e.mode))
 }
 
 type profilesUnsupportedEncoder struct {
@@ -492,7 +495,7 @@ func (ecsDataPointsEncoder) encodeMetrics(
 	validationErrors *[]error,
 	idx elasticsearch.Index,
 	buf *bytes.Buffer,
-) (map[string]string, error) {
+) (map[string]string, otelserializer.MetricsDocInfo, error) {
 	dp0 := dataPoints[0]
 	var document objmodel.Document
 
@@ -525,7 +528,7 @@ func (ecsDataPointsEncoder) encodeMetrics(
 	}
 	err := document.Serialize(buf, true, metricsProtectedFields)
 
-	return document.DynamicTemplates(), err
+	return document.DynamicTemplates(), otelserializer.MetricsDocInfo{}, err
 }
 
 func addDataStreamAttributes(document *objmodel.Document, key string, idx elasticsearch.Index) {

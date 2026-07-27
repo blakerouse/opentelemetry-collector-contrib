@@ -234,7 +234,7 @@ func TestEncodeMetric(t *testing.T) {
 	for _, dataPoints := range groupedDataPoints {
 		var buf bytes.Buffer
 		errors := make([]error, 0)
-		_, err := encoder.encodeMetrics(
+		_, _, err := encoder.encodeMetrics(
 			encodingContext{
 				resource:          rm.Resource(),
 				resourceSchemaURL: rm.SchemaUrl(),
@@ -325,7 +325,7 @@ func TestEncodeMetricDocCountHint(t *testing.T) {
 
 			var buf bytes.Buffer
 			validationErrors := make([]error, 0)
-			_, err := encoder.encodeMetrics(ec, dataPoints, &validationErrors, idx, &buf)
+			_, _, err := encoder.encodeMetrics(ec, dataPoints, &validationErrors, idx, &buf)
 			require.NoError(t, err)
 			require.Empty(t, validationErrors)
 

@@ -10,17 +10,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/xexporterhelper"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	pdatareq "go.opentelemetry.io/collector/pdata/xpdata/request"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/metricgroup"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/pool"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/serializer/otelserializer"
 )
 
 // sessionTarget selects which bulk indexer a bulk item is written to. Logs,
@@ -41,6 +45,27 @@ const (
 	numSessionTargets
 )
 
+// itemKind distinguishes how an encodedItem's doc bytes are consumed.
+//
+// The numeric values are persisted in the early-encoded persistent-queue wire
+// format (see marshalEncodedRequest): append new kinds before numItemKinds
+// only, and never reorder or remove existing ones.
+type itemKind uint8
+
+const (
+	// itemKindDoc is a final document sent as-is (logs, traces, profiles, and
+	// unmergeable metric docs).
+	itemKindDoc itemKind = iota
+	// itemKindMergeableMetrics is a final OTel-mode metrics document that can
+	// be merged with same-group documents by byte splicing at consume time.
+	itemKindMergeableMetrics
+	// itemKindDeferredMetrics is a proto-marshaled pmetric.Metrics holding
+	// ECS-mode scopes; grouped and encoded at consume time over the whole
+	// batch, like the legacy pdata path.
+	itemKindDeferredMetrics
+	numItemKinds
+)
+
 // encodedItem is a single record that has already been serialized to its final
 // bulk item form (index routing, document id, pipeline, dynamic templates,
 // action, target indexer and the encoded document bytes). Serializing at ingest
@@ -57,10 +82,41 @@ type encodedItem struct {
 	dynamicTemplates map[string]string
 	mappingMode      MappingMode
 	target           sessionTarget
-	// doc is the final serialized bulk-item body. It is populated only on the
-	// early/ingest path (by itemSink, from the separate encodedDoc handed to
-	// docSink.add); the streaming/legacy path never sets it.
+	kind             itemKind
+	// doc is the final serialized bulk-item body (or, for
+	// itemKindDeferredMetrics, the proto-marshaled pdata). It is populated only
+	// on the early/ingest path (by itemSink, from the separate encodedDoc
+	// handed to docSink.add); the streaming/legacy path never sets it.
 	doc []byte
+
+	// Merge metadata, set only for itemKindMergeableMetrics: the data point
+	// group identity, the offsets of the inner "metrics" object fields within
+	// doc, the sorted metric names, and the _doc_count. Same-group documents
+	// are merged at consume time; see consumeEncodedItems.
+	groupKey    metricgroup.HashKey
+	fragStart   int
+	fragEnd     int
+	metricNames []string
+	docCount    uint64
+
+	// deferredMetrics, set only for itemKindDeferredMetrics created at ingest,
+	// holds the original payload by reference — no copy, no serialization (the
+	// legacy pdata path's memory profile). doc stays nil until the item is
+	// persisted (see marshalEncodedRequest); items read back from disk have doc
+	// set instead. For deferred items, mappingMode records the request-default
+	// mapping mode so the consumer can re-resolve scope modes deterministically,
+	// and deferredSize is the payload's proto size for the byte sizers.
+	deferredMetrics pmetric.Metrics
+	deferredSize    int
+}
+
+// size returns the item's contribution to request byte sizing: the encoded doc
+// length, or the payload proto size for a not-yet-marshaled deferred item.
+func (it *encodedItem) size() int {
+	if it.doc == nil {
+		return it.deferredSize
+	}
+	return len(it.doc)
 }
 
 // encodedRequest is an exporterhelper request.Request carrying a slice of
@@ -76,7 +132,7 @@ var _ xexporterhelper.Request = (*encodedRequest)(nil)
 func newEncodedRequest(items []encodedItem) *encodedRequest {
 	var bytesSize int
 	for i := range items {
-		bytesSize += len(items[i].doc)
+		bytesSize += items[i].size()
 	}
 	return &encodedRequest{items: items, bytesSize: bytesSize}
 }
@@ -159,7 +215,7 @@ func splitByBytes(items []encodedItem, maxSize int) []xexporterhelper.Request {
 
 	start := 0
 	for i := range items {
-		size := len(items[i].doc)
+		size := items[i].size()
 		if size >= maxSize {
 			if i > start {
 				emit(items[start:i])
@@ -354,7 +410,11 @@ func (e *elasticsearchExporter) pushEncodedRequest(ctx context.Context, req xexp
 }
 
 // consumeEncodedItems assembles already-encoded items into the appropriate bulk
-// indexer sessions and flushes them.
+// indexer sessions and flushes them. Plain items are streamed as-is; mergeable
+// metric documents with the same group identity are merged by byte splicing,
+// and deferred ECS-mode metrics are grouped and encoded here over the whole
+// batch — both restoring the batch-wide document grouping of the legacy pdata
+// path.
 func (e *elasticsearchExporter) consumeEncodedItems(ctx context.Context, items []encodedItem) error {
 	var sessions encodedSessionSet
 	sessions.init(e)
@@ -366,8 +426,18 @@ func (e *elasticsearchExporter) consumeEncodedItems(ctx context.Context, items [
 	// the consumer critical path.
 	var reader bytes.Reader
 	var errs []error
+	var merger metricsDocMerger
+	var deferred []*encodedItem
 	for i := range items {
 		item := &items[i]
+		switch item.kind {
+		case itemKindMergeableMetrics:
+			merger.add(item)
+			continue
+		case itemKindDeferredMetrics:
+			deferred = append(deferred, item)
+			continue
+		}
 		session := sessions.get(ctx, item)
 		reader.Reset(item.doc)
 		if err := session.Add(
@@ -386,6 +456,35 @@ func (e *elasticsearchExporter) consumeEncodedItems(ctx context.Context, items [
 		}
 	}
 
+	for _, group := range merger.groups {
+		item := group.items[0]
+		body, dynamicTemplates := group.assemble(&reader)
+		session := sessions.get(ctx, item)
+		if err := session.Add(
+			ctx,
+			item.index,
+			item.docID,
+			item.pipeline,
+			body,
+			dynamicTemplates,
+			item.action,
+		); err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			errs = append(errs, err)
+		}
+	}
+
+	if len(deferred) > 0 {
+		if err := e.consumeDeferredMetrics(ctx, &sessions, deferred); err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			errs = append(errs, err)
+		}
+	}
+
 	if err := sessions.flush(ctx); err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
@@ -393,6 +492,174 @@ func (e *elasticsearchExporter) consumeEncodedItems(ctx context.Context, items [
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// consumeDeferredMetrics groups the deferred (ECS-mode) payloads over the
+// whole batch and encodes the resulting documents into sessions. Each item's
+// payload — held as pdata from ingest, or unmarshaled from its persisted proto
+// bytes — is re-walked with the item's recorded default mapping mode, and only
+// the scopes resolving to ECS are collected (the others were already encoded
+// at ingest). The walk only reads the payloads, so held pdata is never copied
+// or mutated and the work is safely repeatable on retry.
+func (e *elasticsearchExporter) consumeDeferredMetrics(ctx context.Context, sessions *encodedSessionSet, deferred []*encodedItem) error {
+	var errs []error
+	groups := newMetricsGroups()
+	unmarshaler := pmetric.ProtoUnmarshaler{}
+	ecsOnly := func(m MappingMode) bool { return m == MappingECS }
+	for _, item := range deferred {
+		m := item.deferredMetrics
+		if item.doc != nil {
+			var err error
+			m, err = unmarshaler.UnmarshalMetrics(item.doc)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("failed to unmarshal deferred metrics payload: %w", err))
+				continue
+			}
+		}
+		defaultMode := item.mappingMode
+		if _, _, err := e.collectMetricsGroups(ctx, groups, m, &defaultMode, ecsOnly); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(groups.byIndex) > 0 || len(groups.validationErrs) > 0 {
+		perRecordErrs, err := e.emitMetricsGroups(ctx, sessionSink{sessions: sessions}, groups)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		if len(perRecordErrs) > 0 {
+			// Deterministic per-record failures: retrying cannot fix them, so
+			// log and count them instead of returning (matching the converter).
+			e.set.Logger.Warn("dropping records that failed to encode",
+				zap.Int("dropped_records", len(perRecordErrs)),
+				zap.Error(errors.Join(perRecordErrs...)))
+			e.telemetryBuilder.ElasticsearchDocsProcessed.Add(ctx, int64(len(perRecordErrs)),
+				metric.WithAttributeSet(attribute.NewSet(append(
+					getAttributesFromMetadataKeys(ctx, e.config.MetadataKeys),
+					withOutcome("failed_client"),
+				)...)))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// mergeGroupKey identifies a mergeable metric document group within a batch.
+type mergeGroupKey struct {
+	mappingMode MappingMode
+	index       string
+	key         metricgroup.HashKey
+}
+
+// metricsDocGroup accumulates mergeable metric items that share a group key and
+// have pairwise-disjoint metric names.
+type metricsDocGroup struct {
+	items    []*encodedItem
+	names    map[string]struct{}
+	docCount uint64
+}
+
+func (g *metricsDocGroup) disjoint(names []string) bool {
+	for _, n := range names {
+		if _, ok := g.names[n]; ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (g *metricsDocGroup) append(item *encodedItem) {
+	g.items = append(g.items, item)
+	for _, n := range item.metricNames {
+		g.names[n] = struct{}{}
+	}
+	if item.docCount != 0 {
+		g.docCount = item.docCount
+	}
+}
+
+// assemble returns the document body for the group and its dynamic templates.
+// A single-item group streams its doc untouched via reader. A merged group is
+// spliced: the first doc up to the end of its "metrics" fields, the other
+// items' fragments joined with commas, and a freshly written tail whose
+// _metric_names_hash covers the sorted union of names — byte-identical to the
+// tail of a document serialized from the merged data points, so the merged
+// document keeps the same TSDB identity the legacy whole-batch encoding
+// produced.
+func (g *metricsDocGroup) assemble(reader *bytes.Reader) (io.WriterTo, map[string]string) {
+	first := g.items[0]
+	if len(g.items) == 1 {
+		reader.Reset(first.doc)
+		return reader, first.dynamicTemplates
+	}
+
+	segments := multiSliceWriterTo{first.doc[:first.fragEnd]}
+	nonEmpty := first.fragEnd > first.fragStart
+	dynamicTemplates := make(map[string]string, len(first.dynamicTemplates)*len(g.items))
+	names := make([]string, 0, len(g.names))
+	for _, item := range g.items {
+		for k, v := range item.dynamicTemplates {
+			dynamicTemplates[k] = v
+		}
+		names = append(names, item.metricNames...)
+	}
+	for _, item := range g.items[1:] {
+		frag := item.doc[item.fragStart:item.fragEnd]
+		if len(frag) == 0 {
+			continue
+		}
+		if nonEmpty {
+			segments = append(segments, jsonComma)
+		}
+		segments = append(segments, frag)
+		nonEmpty = true
+	}
+	sort.Strings(names)
+	var tail bytes.Buffer
+	otelserializer.AppendMergedMetricsTail(&tail, g.docCount, names)
+	segments = append(segments, tail.Bytes())
+	return segments, dynamicTemplates
+}
+
+var jsonComma = []byte{','}
+
+// metricsDocMerger buckets mergeable metric items by group key. Items whose
+// metric names overlap an existing bucket start a new one (identical name sets
+// are true duplicates that Elasticsearch TSDB deduplicates, as before).
+type metricsDocMerger struct {
+	byKey  map[mergeGroupKey][]*metricsDocGroup
+	groups []*metricsDocGroup // in insertion order
+}
+
+func (m *metricsDocMerger) add(item *encodedItem) {
+	key := mergeGroupKey{mappingMode: item.mappingMode, index: item.index, key: item.groupKey}
+	if m.byKey == nil {
+		m.byKey = make(map[mergeGroupKey][]*metricsDocGroup)
+	}
+	for _, g := range m.byKey[key] {
+		if g.disjoint(item.metricNames) {
+			g.append(item)
+			return
+		}
+	}
+	g := &metricsDocGroup{names: make(map[string]struct{}, len(item.metricNames))}
+	g.append(item)
+	m.byKey[key] = append(m.byKey[key], g)
+	m.groups = append(m.groups, g)
+}
+
+// multiSliceWriterTo streams a sequence of byte slices, used to assemble merged
+// documents without copying.
+type multiSliceWriterTo [][]byte
+
+func (m multiSliceWriterTo) WriteTo(w io.Writer) (int64, error) {
+	var n int64
+	for _, s := range m {
+		k, err := w.Write(s)
+		n += int64(k)
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // encodedSessionSet lazily starts the bulk indexer sessions needed to consume a
@@ -557,7 +824,7 @@ type encodedEncoding[T any] struct {
 func (encodedEncoding[T]) Marshal(ctx context.Context, req xexporterhelper.Request) ([]byte, error) {
 	switch r := req.(type) {
 	case *encodedRequest:
-		return marshalEncodedRequest(r), nil
+		return marshalEncodedRequest(r)
 	case *pdataRequest[T]:
 		// Legacy pdata on-disk format (gate off or metadata_keys configured):
 		// keeps the queue readable by older collector versions.
@@ -604,11 +871,22 @@ func (enc encodedEncoding[T]) Unmarshal(b []byte) (context.Context, xexporterhel
 //	repeated itemCount times:
 //	  uvarint mappingMode
 //	  uvarint target
+//	  uvarint kind
+//	  if kind == itemKindMergeableMetrics:
+//	    uvarint groupKey.resource, groupKey.scope, groupKey.dataPoint
+//	    uvarint fragStart, fragEnd
+//	    uvarint metricNamesCount
+//	    repeated: string name
+//	    uvarint docCount
 //	  string  index, docID, pipeline, action        (uvarint length + bytes)
 //	  uvarint dynamicTemplatesCount
 //	  repeated: string key, string value
 //	  bytes   doc                                    (uvarint length + bytes)
-func marshalEncodedRequest(r *encodedRequest) []byte {
+//
+// A deferred-metrics item created at ingest holds its payload as pdata
+// (deferredMetrics) and is proto-marshaled here, on persist; its doc bytes are
+// the full original payload, which the consumer re-walks and filters.
+func marshalEncodedRequest(r *encodedRequest) ([]byte, error) {
 	buf := make([]byte, 0, r.bytesSize+16*len(r.items)+8)
 	buf = append(buf, earlyEncodedMagic, earlyEncodedVersion)
 	buf = binary.AppendUvarint(buf, uint64(len(r.items)))
@@ -616,6 +894,20 @@ func marshalEncodedRequest(r *encodedRequest) []byte {
 		it := &r.items[i]
 		buf = binary.AppendUvarint(buf, uint64(it.mappingMode))
 		buf = binary.AppendUvarint(buf, uint64(it.target))
+		buf = binary.AppendUvarint(buf, uint64(it.kind))
+		if it.kind == itemKindMergeableMetrics {
+			kr, ks, kd := it.groupKey.Uint64s()
+			buf = binary.AppendUvarint(buf, kr)
+			buf = binary.AppendUvarint(buf, ks)
+			buf = binary.AppendUvarint(buf, kd)
+			buf = binary.AppendUvarint(buf, uint64(it.fragStart))
+			buf = binary.AppendUvarint(buf, uint64(it.fragEnd))
+			buf = binary.AppendUvarint(buf, uint64(len(it.metricNames)))
+			for _, name := range it.metricNames {
+				buf = appendLenPrefixedString(buf, name)
+			}
+			buf = binary.AppendUvarint(buf, it.docCount)
+		}
 		buf = appendLenPrefixedString(buf, it.index)
 		buf = appendLenPrefixedString(buf, it.docID)
 		buf = appendLenPrefixedString(buf, it.pipeline)
@@ -625,9 +917,17 @@ func marshalEncodedRequest(r *encodedRequest) []byte {
 			buf = appendLenPrefixedString(buf, k)
 			buf = appendLenPrefixedString(buf, v)
 		}
-		buf = appendLenPrefixed(buf, it.doc)
+		doc := it.doc
+		if it.kind == itemKindDeferredMetrics && doc == nil {
+			var err error
+			doc, err = (&pmetric.ProtoMarshaler{}).MarshalMetrics(it.deferredMetrics)
+			if err != nil {
+				return nil, fmt.Errorf("elasticsearchexporter: failed to marshal deferred metrics payload: %w", err)
+			}
+		}
+		buf = appendLenPrefixed(buf, doc)
 	}
-	return buf
+	return buf, nil
 }
 
 func unmarshalEncodedRequest(b []byte) (*encodedRequest, error) {
@@ -659,6 +959,57 @@ func unmarshalEncodedRequest(b []byte) (*encodedRequest, error) {
 		}
 		if target >= uint64(numSessionTargets) {
 			return nil, fmt.Errorf("elasticsearchexporter: corrupt early-encoded payload: invalid session target %d", target)
+		}
+		kind, err := r.uvarint()
+		if err != nil {
+			return nil, err
+		}
+		if kind >= uint64(numItemKinds) {
+			return nil, fmt.Errorf("elasticsearchexporter: corrupt early-encoded payload: invalid item kind %d", kind)
+		}
+		var groupKey metricgroup.HashKey
+		var fragStart, fragEnd uint64
+		var metricNames []string
+		var docCount uint64
+		if itemKind(kind) == itemKindMergeableMetrics {
+			var kr, ks, kd uint64
+			if kr, err = r.uvarint(); err != nil {
+				return nil, err
+			}
+			if ks, err = r.uvarint(); err != nil {
+				return nil, err
+			}
+			if kd, err = r.uvarint(); err != nil {
+				return nil, err
+			}
+			groupKey = metricgroup.NewHashKey(kr, ks, kd)
+			if fragStart, err = r.uvarint(); err != nil {
+				return nil, err
+			}
+			if fragEnd, err = r.uvarint(); err != nil {
+				return nil, err
+			}
+			nameCount, err := r.uvarint()
+			if err != nil {
+				return nil, err
+			}
+			// Each name takes at least one length-prefix byte; cap the
+			// preallocation hint so a corrupt count can't drive a huge
+			// allocation before the per-name decode fails.
+			if nameCount > uint64(len(b)) {
+				return nil, errors.New("elasticsearchexporter: corrupt early-encoded payload: metric name count exceeds payload size")
+			}
+			metricNames = make([]string, 0, min(nameCount, uint64(len(b)-r.pos)+1))
+			for range nameCount {
+				name, err := r.string()
+				if err != nil {
+					return nil, err
+				}
+				metricNames = append(metricNames, name)
+			}
+			if docCount, err = r.uvarint(); err != nil {
+				return nil, err
+			}
 		}
 		index, err := r.string()
 		if err != nil {
@@ -699,6 +1050,10 @@ func unmarshalEncodedRequest(b []byte) (*encodedRequest, error) {
 		if err != nil {
 			return nil, err
 		}
+		if itemKind(kind) == itemKindMergeableMetrics &&
+			(fragStart == 0 || fragStart > fragEnd || fragEnd > uint64(len(doc))) {
+			return nil, errors.New("elasticsearchexporter: corrupt early-encoded payload: invalid metric fragment offsets")
+		}
 		items = append(items, encodedItem{
 			index:            index,
 			docID:            docID,
@@ -707,7 +1062,13 @@ func unmarshalEncodedRequest(b []byte) (*encodedRequest, error) {
 			dynamicTemplates: dynamicTemplates,
 			mappingMode:      MappingMode(mm),
 			target:           sessionTarget(target),
+			kind:             itemKind(kind),
 			doc:              doc,
+			groupKey:         groupKey,
+			fragStart:        int(fragStart),
+			fragEnd:          int(fragEnd),
+			metricNames:      metricNames,
+			docCount:         docCount,
 		})
 	}
 	return newEncodedRequest(items), nil

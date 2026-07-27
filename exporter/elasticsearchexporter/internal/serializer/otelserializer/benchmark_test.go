@@ -258,7 +258,7 @@ func BenchmarkSerializeMetrics(b *testing.B) {
 			for b.Loop() {
 				buf.Reset()
 				validationErrors = validationErrors[:0]
-				_, _ = ser.SerializeMetrics(rm.Resource(), "", sm.Scope(), "", dps, &validationErrors, idx, &buf)
+				_, _, _ = ser.SerializeMetrics(rm.Resource(), "", sm.Scope(), "", dps, &validationErrors, idx, &buf)
 			}
 		})
 	}
