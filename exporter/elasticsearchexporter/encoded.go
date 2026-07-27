@@ -24,6 +24,10 @@ import (
 // profiles fan out across the dedicated profiling indexers as well.
 type sessionTarget uint8
 
+// The numeric values are persisted in the early-encoded persistent-queue wire
+// format (see marshalEncodedRequest): append new targets before
+// numSessionTargets only, and never reorder or remove existing ones, or items
+// drained from disk after an upgrade will be routed to the wrong indexer.
 const (
 	targetDefault sessionTarget = iota
 	targetProfilingEvents

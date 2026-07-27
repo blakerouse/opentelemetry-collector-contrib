@@ -1211,3 +1211,24 @@ func TestCreateLogsExporter_EarlyEncodingWithPersistentQueue(t *testing.T) {
 	require.NoError(t, exp.ConsumeLogs(context.Background(), logs))
 	rec.WaitItems(1)
 }
+
+// TestPersistedEnumValuesAreStable pins the numeric values of the enums that are
+// persisted in the early-encoded persistent-queue wire format. If this test
+// fails, an enum was reordered or a value was inserted mid-enum: items already
+// on disk would decode with the wrong mapping mode or session target. Append new
+// values at the end (before the Num* sentinel) instead.
+func TestPersistedEnumValuesAreStable(t *testing.T) {
+	require.Equal(t, MappingMode(0), MappingNone)
+	require.Equal(t, MappingMode(1), MappingECS)
+	require.Equal(t, MappingMode(2), MappingOTel)
+	require.Equal(t, MappingMode(3), MappingRaw)
+	require.Equal(t, MappingMode(4), MappingBodyMap)
+	require.Equal(t, MappingMode(5), NumMappingModes)
+
+	require.Equal(t, sessionTarget(0), targetDefault)
+	require.Equal(t, sessionTarget(1), targetProfilingEvents)
+	require.Equal(t, sessionTarget(2), targetProfilingStackTraces)
+	require.Equal(t, sessionTarget(3), targetProfilingStackFrames)
+	require.Equal(t, sessionTarget(4), targetProfilingExecutables)
+	require.Equal(t, sessionTarget(5), numSessionTargets)
+}
