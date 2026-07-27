@@ -254,12 +254,10 @@ func TestEncodedLogsRequest_MergeSplit(t *testing.T) {
 		require.ErrorContains(t, err, "incompatible Request type")
 	})
 
-	t.Run("sizer requests keeps single request", func(t *testing.T) {
+	t.Run("sizer requests is unsupported", func(t *testing.T) {
 		r := newEncodedRequest(makeItems(1, 1, 1))
-		out, err := r.MergeSplit(context.Background(), 2, exporterhelper.RequestSizerTypeRequests, nil)
-		require.NoError(t, err)
-		require.Len(t, out, 1)
-		require.Equal(t, 3, out[0].ItemsCount())
+		_, err := r.MergeSplit(context.Background(), 2, exporterhelper.RequestSizerTypeRequests, nil)
+		require.ErrorContains(t, err, "unsupported sizer type")
 	})
 
 	t.Run("sizer bytes splits", func(t *testing.T) {

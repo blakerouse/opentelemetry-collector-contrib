@@ -181,8 +181,6 @@ func (r *encodedRequest) MergeSplit(
 		return splitByBytes(merged, maxSize), nil
 	case exporterhelper.RequestSizerTypeItems:
 		return splitByCount(merged, maxSize), nil
-	case exporterhelper.RequestSizerTypeRequests:
-		return []xexporterhelper.Request{newEncodedRequest(merged)}, nil
 	default:
 		return nil, fmt.Errorf("elasticsearchexporter: unsupported sizer type %q", sizerType.String())
 	}
