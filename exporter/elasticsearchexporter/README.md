@@ -100,6 +100,13 @@ sending_queue:
 
 The default configurations are chosen to be closer to the defaults with the exporter's previous inbuilt batching feature. The [`exporterhelper` documentation][exporterhelper] provides more details on the `sending_queue` settings.
 
+Because records are encoded to their final form at ingest time, "items" — as counted by the `items` sizer (for
+`sending_queue::sizer` or `sending_queue::batch::sizer`) and by the standard `otelcol_exporter_sent_*` /
+`otelcol_exporter_send_failed_*` metrics — are Elasticsearch **documents**, not pdata records. Log records map 1:1,
+but each span event becomes its own document (increasing trace counts), metric data points are grouped into one
+document per timestamp and dimensions (decreasing metric counts), and profiles fan out into multiple documents.
+Adjust any `items`-based thresholds or dashboards accordingly.
+
 ### Elasticsearch document routing
 
 Documents are statically or dynamically routed to the target index / data stream in the following order. The first routing mode that applies will be used.
