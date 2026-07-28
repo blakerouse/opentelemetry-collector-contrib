@@ -305,7 +305,7 @@ type MappingMode int
 // Enum values for MappingMode.
 //
 // The numeric values are persisted in the early-encoded persistent-queue wire
-// format (see marshalEncodedRequest in encoded.go): append new modes before
+// format (see marshalEncodedRequest in request_codec.go): append new modes before
 // NumMappingModes only, and never reorder or remove existing ones, or items
 // drained from disk after an upgrade will be decoded with the wrong mode.
 const (

@@ -97,7 +97,7 @@ func createDefaultConfig() component.Config {
 }
 
 // Every signal follows the same request-based shape (NewXRequest +
-// pushEncodedRequest). useEarlyEncoding (see encoded.go) only selects the
+// pushEncodedRequest). useEarlyEncoding (see request.go) only selects the
 // ingest-time converter: newEncodedConverter serializes each record at ingest
 // (and, with a persistent queue, stores the early-encoded format on disk),
 // while newPdataConverter wraps the raw pdata so the persistent queue keeps
@@ -216,8 +216,19 @@ func createProfilesExporter(
 // requestQueueBatchSettings builds the QueueBatchSettings for the request
 // pipeline: reference counting for requests that hold pdata, and — when a
 // persistent queue is configured — the Encoding that writes both request
-// formats and reads both back (see encoded.go). pdataConverter wraps pdata
-// payloads read from disk so the request keeps the sizing it was offered with.
+// formats and reads both back. pdataConverter wraps pdata payloads read from
+// disk so the request keeps the sizing it was offered with.
+//
+// Upstream exporterhelper behaviors this exporter relies on; verify them when
+// bumping exporterhelper:
+//   - the batcher flushes over-maxSize requests returned by MergeSplit
+//     immediately, retaining only the last (smallest) as the pending batch;
+//   - the memory queue refs a request on Offer and unrefs it after consume,
+//     while the persistent queue marshals on Offer and never holds requests;
+//   - batching/merging happens after dequeue, so persisted requests always
+//     round-trip through Encoding.Marshal/Unmarshal;
+//   - the request-converter path wraps converter errors as permanent (see
+//     unwrapPermanent).
 func requestQueueBatchSettings[T any](
 	cf *Config,
 	pdataConverter xexporterhelper.RequestConverterFunc[T],
@@ -233,7 +244,7 @@ func requestQueueBatchSettings[T any](
 		refMetrics: pref.RefMetrics, unrefMetrics: pref.UnrefMetrics,
 	}
 	if cf.QueueBatchConfig.HasValue() && cf.QueueBatchConfig.Get().StorageID != nil {
-		qbs.Encoding = encodedEncoding[T]{
+		qbs.Encoding = queueEncoding[T]{
 			wrapPdata:      pdataConverter,
 			unmarshalCtx:   unmarshalCtx,
 			unmarshalPlain: unmarshalPlain,

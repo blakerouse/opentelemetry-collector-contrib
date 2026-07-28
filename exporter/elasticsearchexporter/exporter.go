@@ -101,28 +101,9 @@ func (e *elasticsearchExporter) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// The push*Data functions stream each record to bulk indexer sessions via a
-// sessionSink and flush; the encode*Records functions collect each record into
-// []encodedItem via an itemSink for the request queue. Both wrap the shared
-// per-signal emit* iteration, so document encoding lives in one place.
-
-// pushStreaming runs a per-signal emit against streaming bulk indexer sessions
-// and flushes. emit is a bound *elasticsearchExporter method.
-func pushStreaming[T any](
-	ctx context.Context,
-	e *elasticsearchExporter,
-	emit func(context.Context, docSink, T) ([]error, error),
-	data T,
-) error {
-	var sessions encodedSessionSet
-	sessions.init(e)
-	defer sessions.end()
-	errs, err := emit(ctx, sessionSink{sessions: &sessions}, data)
-	if err != nil {
-		return err
-	}
-	return flushSessions(ctx, &sessions, errs)
-}
+// The encode*Records functions collect each record into []encodedItem via an
+// itemSink for the request queue, wrapping the shared per-signal emit*
+// iteration so document encoding lives in one place.
 
 // collectItems runs a per-signal emit against a buffering itemSink, returning
 // the materialized items. capacity is a preallocation hint.
@@ -138,10 +119,6 @@ func collectItems[T any](
 		return nil, nil, err
 	}
 	return sink.items, perRecordErrs, nil
-}
-
-func (e *elasticsearchExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
-	return pushStreaming(ctx, e, e.emitLogs, ld)
 }
 
 func (e *elasticsearchExporter) encodeLogRecords(ctx context.Context, ld plog.Logs) ([]encodedItem, []error, error) {
@@ -222,18 +199,6 @@ func (e *elasticsearchExporter) emitLogRecord(
 	}, pooledDoc(buf))
 }
 
-// flushSessions flushes all bulk indexer sessions started while streaming and
-// joins the flush error into errs, honoring context cancellation.
-func flushSessions(ctx context.Context, sessions *encodedSessionSet, errs []error) error {
-	if err := sessions.flush(ctx); err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return cerr
-		}
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
-}
-
 type dataPointsGroup struct {
 	resource          pcommon.Resource
 	resourceSchemaURL string
@@ -244,10 +209,6 @@ type dataPointsGroup struct {
 
 func (p *dataPointsGroup) addDataPoint(dp datapoints.DataPoint) {
 	p.dataPoints = append(p.dataPoints, dp)
-}
-
-func (e *elasticsearchExporter) pushMetricsData(ctx context.Context, metrics pmetric.Metrics) error {
-	return pushStreaming(ctx, e, e.emitMetrics, metrics)
 }
 
 func (e *elasticsearchExporter) encodeMetricRecords(ctx context.Context, metrics pmetric.Metrics) ([]encodedItem, []error, error) {
@@ -293,18 +254,6 @@ func countScopes(metrics pmetric.Metrics) int {
 		n += rm.ScopeMetrics().Len()
 	}
 	return n
-}
-
-// emitMetrics groups data points into documents, then encodes each group and
-// hands it to sink. Validation errors are logged (not returned) so upstream does
-// not retry; other per-record errors are returned via perRecordErrs.
-func (e *elasticsearchExporter) emitMetrics(ctx context.Context, sink docSink, metrics pmetric.Metrics) ([]error, error) {
-	groups := newMetricsGroups()
-	if _, _, err := e.collectMetricsGroups(ctx, groups, metrics, nil, nil); err != nil {
-		return nil, err
-	}
-	encodeErrs, addErrs, err := e.emitMetricsGroups(ctx, sink, groups)
-	return append(encodeErrs, addErrs...), err
 }
 
 // mappingIndexKey identifies a metric document group's routing.
@@ -524,10 +473,6 @@ func (e *elasticsearchExporter) emitMetricsGroups(ctx context.Context, sink docS
 	return encodeErrs, addErrs, nil
 }
 
-func (e *elasticsearchExporter) pushTraceData(ctx context.Context, td ptrace.Traces) error {
-	return pushStreaming(ctx, e, e.emitTraces, td)
-}
-
 func (e *elasticsearchExporter) encodeTraceRecords(ctx context.Context, td ptrace.Traces) ([]encodedItem, []error, error) {
 	// SpanCount is a lower bound (span events add more items) but a good hint.
 	return collectItems(ctx, e.emitTraces, td, td.SpanCount())
@@ -693,10 +638,6 @@ func extractControlAttrs(attrs pcommon.Map, captureDocID, capturePipeline bool) 
 		}
 	}
 	return c
-}
-
-func (e *elasticsearchExporter) pushProfilesData(ctx context.Context, pd pprofile.Profiles) error {
-	return pushStreaming(ctx, e, e.emitProfiles, pd)
 }
 
 func (e *elasticsearchExporter) encodeProfileRecords(ctx context.Context, pd pprofile.Profiles) ([]encodedItem, []error, error) {
