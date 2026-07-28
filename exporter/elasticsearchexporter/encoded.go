@@ -59,21 +59,16 @@ const (
 	// itemKindMergeableMetrics is a final OTel-mode metrics document that can
 	// be merged with same-group documents by byte splicing at consume time.
 	itemKindMergeableMetrics
-	// itemKindDeferredMetrics is a proto-marshaled pmetric.Metrics holding
-	// ECS-mode scopes; grouped and encoded at consume time over the whole
-	// batch, like the legacy pdata path.
+	// itemKindDeferredMetrics is a pmetric.Metrics payload holding ECS-mode
+	// scopes, grouped and encoded at consume time over the whole batch.
 	itemKindDeferredMetrics
 	numItemKinds
 )
 
-// encodedItem is a single record that has already been serialized to its final
-// bulk item form (index routing, document id, pipeline, dynamic templates,
-// action, target indexer and the encoded document bytes). Serializing at ingest
-// time (in the request converter, which runs on the ConsumeX caller goroutines)
-// moves the per-record JSON encoding off the sending-queue consumer's critical
-// path: the consumer only has to assemble these pre-encoded bytes into a bulk
-// request and send it. The shape is signal-agnostic: it matches the arguments of
-// every signal's bulkIndexerSession.Add call.
+// encodedItem is a single record serialized to its final bulk item form.
+// Serializing at ingest (in the request converter, on the ConsumeX caller
+// goroutines) keeps per-record JSON encoding off the queue consumer's critical
+// path. The shape is signal-agnostic, matching bulkIndexerSession.Add.
 type encodedItem struct {
 	index            string
 	docID            string
@@ -83,37 +78,36 @@ type encodedItem struct {
 	mappingMode      MappingMode
 	target           sessionTarget
 	kind             itemKind
-	// doc is the final serialized bulk-item body (or, for
-	// itemKindDeferredMetrics, the proto-marshaled pdata). It is populated only
-	// on the early/ingest path (by itemSink, from the separate encodedDoc
-	// handed to docSink.add); the streaming/legacy path never sets it.
+	// doc is the final serialized bulk-item body — or, for a deferred-metrics
+	// item read back from the persistent queue, the proto-marshaled pdata.
 	doc []byte
 
 	// Merge metadata, set only for itemKindMergeableMetrics: the data point
 	// group identity, the offsets of the inner "metrics" object fields within
 	// doc, the sorted metric names, and the _doc_count. Same-group documents
 	// are merged at consume time; see consumeEncodedItems.
-	groupKey    metricgroup.HashKey
-	fragStart   int
-	fragEnd     int
-	metricNames []string
-	docCount    uint64
+	groupKey       metricgroup.HashKey
+	fragStart      int
+	fragEnd        int
+	metricNames    []string
+	docCount       uint64
+	docCountHinted bool
 
 	// deferredMetrics, set only for itemKindDeferredMetrics created at ingest,
-	// holds the original payload by reference — no copy, no serialization (the
-	// legacy pdata path's memory profile). doc stays nil until the item is
-	// persisted (see marshalEncodedRequest); items read back from disk have doc
-	// set instead. For deferred items, mappingMode records the request-default
-	// mapping mode so the consumer can re-resolve scope modes deterministically,
-	// and deferredSize is the deferred data's proto size for the byte sizers.
-	// deferredScopes, set only for a mixed-mode payload, lists the scopes that
-	// were actually deferred (nil = all of them): sizing and persistence are
-	// restricted to those, since the payload's other scopes already exist as
-	// encoded doc items and must not be counted or stored twice. It is never
-	// serialized — persisted payloads are pre-filtered.
+	// holds the original payload by reference until the item is persisted (see
+	// marshalEncodedRequest) or consumed; items read back from disk carry doc
+	// instead. For deferred items, mappingMode records the request-default
+	// mapping mode used to re-resolve scope modes at consume. The payload is
+	// ref-counted across the memory queue by pdataRefCounter; as with the
+	// standard pdata requests, that protection ends once the batcher retains a
+	// pending batch (relevant only if pdata.useProtoPooling is enabled).
 	deferredMetrics pmetric.Metrics
-	deferredScopes  []scopeRef
-	deferredSize    int
+	// deferredScopes lists the deferred scopes of a mixed-mode payload (nil =
+	// all of them); sizing and persistence cover only those, since the other
+	// scopes already exist as encoded doc items. Never serialized.
+	deferredScopes []scopeRef
+	// deferredSize is the deferred data's proto size, used by the byte sizers.
+	deferredSize int
 }
 
 // size returns the item's contribution to request byte sizing: the encoded doc
@@ -131,16 +125,22 @@ func (it *encodedItem) size() int {
 type encodedRequest struct {
 	items     []encodedItem
 	bytesSize int
+	// holdsPdata is true when any item holds pdata by reference (a deferred
+	// metrics item not yet marshaled), so the reference counter can skip
+	// scanning items on requests that cannot hold any.
+	holdsPdata bool
 }
 
 var _ xexporterhelper.Request = (*encodedRequest)(nil)
 
 func newEncodedRequest(items []encodedItem) *encodedRequest {
 	var bytesSize int
+	var holdsPdata bool
 	for i := range items {
 		bytesSize += items[i].size()
+		holdsPdata = holdsPdata || (items[i].kind == itemKindDeferredMetrics && items[i].doc == nil)
 	}
-	return &encodedRequest{items: items, bytesSize: bytesSize}
+	return &encodedRequest{items: items, bytesSize: bytesSize, holdsPdata: holdsPdata}
 }
 
 // ItemsCount returns the number of bulk items (records) in the request.
@@ -164,8 +164,8 @@ func (r *encodedRequest) MergeSplit(
 	if req != nil {
 		other, ok := req.(*encodedRequest)
 		if !ok {
-			// A pdataRequest can reach the batcher unconverted when the
-			// persistent queue's marshal round-trip is bypassed; convert it here.
+			// A pdataRequest (offered directly or read back from a persistent
+			// queue) reaches the batcher unconverted; convert it here.
 			conv, isEncodable := req.(encodableRequest)
 			if !isEncodable {
 				return nil, errors.New("elasticsearchexporter: MergeSplit got incompatible Request type")
@@ -193,27 +193,19 @@ func (r *encodedRequest) MergeSplit(
 }
 
 // splitByBytes places items into bins of at most maxSize bytes (measured by
-// encoded document size). Items that individually equal or exceed maxSize are
-// emitted as their own single-item Request, deliberately exceeding maxSize:
-// the upstream pdata requests drop such records with an error instead, but the
-// batcher flushes oversize results immediately (never retaining them), and the
-// bulk session's maxFlushBytes force-flush bounds the actual request body — so
-// sending the record is strictly friendlier than dropping it. Pinned by
-// TestSplitByBytes_OversizedItemSentNotDropped. Only the last Request is
-// guaranteed to be the smallest, so we track the running minimum and swap it
-// to the end once rather than sorting.
+// encoded document size). An item that alone reaches maxSize is emitted as its
+// own over-limit single-item Request rather than dropped; that is safe because
+// the batcher flushes oversize requests immediately and the bulk session's
+// maxFlushBytes force-flush bounds the actual request body. Only the last
+// Request must be the smallest, so the running minimum is swapped to the end
+// instead of sorting.
 func splitByBytes(items []encodedItem, maxSize int) []xexporterhelper.Request {
 	var out []xexporterhelper.Request
 	var curSize, minIdx, minSize int
 
 	emit := func(slice []encodedItem) {
-		// Clamp cap to len (three-index slice). The sub-requests returned here
-		// alias one backing array; the batcher keeps one as its pending batch and
-		// flushes the others on worker goroutines. A later MergeSplit appends into
-		// the retained request's items, so without cap==len that append would write
-		// into a sibling's region of the shared array — corrupting a request that is
-		// (or is about to be) read by a flush goroutine. cap==len forces the append
-		// to reallocate instead.
+		// cap==len so a later MergeSplit append on the retained sub-request
+		// reallocates instead of writing into a sibling's shared backing array.
 		req := newEncodedRequest(slice[:len(slice):len(slice)])
 		out = append(out, req)
 		if size := req.BytesSize(); len(out) == 1 || size < minSize {
@@ -258,9 +250,8 @@ func splitByCount(items []encodedItem, maxCount int) []xexporterhelper.Request {
 	out := make([]xexporterhelper.Request, 0, (len(items)+maxCount-1)/maxCount)
 	for i := 0; i < len(items); i += maxCount {
 		end := min(i+maxCount, len(items))
-		// Clamp cap to len (three-index slice) so a later MergeSplit append on a
-		// retained sub-request reallocates instead of overwriting a sibling that
-		// shares this backing array; see splitByBytes.
+		// cap==len so a later append reallocates instead of overwriting a
+		// sibling's shared backing array; see splitByBytes.
 		out = append(out, newEncodedRequest(items[i:end:end]))
 	}
 	return out
@@ -268,12 +259,8 @@ func splitByCount(items []encodedItem, maxCount int) []xexporterhelper.Request {
 
 // recordEncoder serializes one pdata payload (plog.Logs, pmetric.Metrics, ...)
 // into encoded bulk items at ingest time. perRecordErrs are deterministic
-// per-record encoding errors: the legacy push path returns them to the caller
-// after flushing, while the converter path drops only the failed records
-// (logging and counting them) and sends the rest — unless every record failed,
-// in which case the conversion fails so a total drop is not reported as
-// success. A non-nil err aborts the whole batch (e.g. mapping-mode resolution
-// failure).
+// per-record encoding failures; a non-nil err aborts the whole payload (e.g.
+// mapping-mode resolution failure).
 type recordEncoder[T any] func(ctx context.Context, data T) (items []encodedItem, perRecordErrs []error, err error)
 
 // convertToEncoded encodes data into an *encodedRequest, dropping (and logging
@@ -283,25 +270,18 @@ type recordEncoder[T any] func(ctx context.Context, data T) (items []encodedItem
 func convertToEncoded[T any](ctx context.Context, e *elasticsearchExporter, encode recordEncoder[T], data T) (*encodedRequest, error) {
 	items, perRecordErrs, err := encode(ctx, data)
 	if err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return nil, cerr
-		}
+		// No ctx.Err() substitution: conversion is pure CPU and every converter
+		// error is treated as permanent; substituting would mask the real cause.
 		return nil, err
 	}
 	if len(perRecordErrs) > 0 {
-		// Every record failed deterministically (e.g. the resolved mapping
-		// mode does not support this signal at all). There is nothing to send,
-		// and returning success would hide a total drop from the pipeline;
-		// fail the conversion so the caller sees the error, as the legacy
-		// push path did.
+		// Nothing encoded: returning success would hide a total drop from the
+		// pipeline, so surface the joined per-record errors instead.
 		if len(items) == 0 {
 			return nil, errors.Join(perRecordErrs...)
 		}
-		// Partial failure: per-record encoding failures are deterministic, so
-		// retrying cannot fix them, and returning an error here would make
-		// exporterhelper drop the whole request, including the successfully
-		// encoded records. Send what we can instead: drop only the failed
-		// records, logging them and counting them as failed_client documents.
+		// Deterministic per-record failures: send what encoded, drop the rest
+		// with a log and a failed_client count; an error would drop everything.
 		e.set.Logger.Warn("dropping records that failed to encode",
 			zap.Int("dropped_records", len(perRecordErrs)),
 			zap.Error(errors.Join(perRecordErrs...)))
@@ -321,8 +301,8 @@ func newEncodedConverter[T any](e *elasticsearchExporter, encode recordEncoder[T
 	return func(ctx context.Context, data T) (xexporterhelper.Request, error) {
 		r, err := convertToEncoded(ctx, e, encode, data)
 		if err != nil {
-			// The request-converter path re-wraps any error as permanent; unwrap
-			// so the surfaced message matches the legacy push path.
+			// The request-converter path re-wraps errors as permanent; unwrap
+			// to avoid a doubled "Permanent error:" prefix.
 			return nil, unwrapPermanent(err)
 		}
 		return r, nil
@@ -330,11 +310,10 @@ func newEncodedConverter[T any](e *elasticsearchExporter, encode recordEncoder[T
 }
 
 // pdataRequest wraps a not-yet-encoded pdata payload so the persistent queue
-// can keep the legacy pdata on-disk format (feature gate off, or metadata_keys
-// configured). It normally lives only between ConsumeX and the queue's Marshal;
-// Unmarshal returns an *encodedRequest, encoding on the consumer goroutine like
-// the legacy path. MergeSplit and pushEncodedRequest still accept it, converting
-// on the spot, for configurations that bypass the marshal round-trip.
+// keeps the pdata on-disk format (feature gate off, or metadata_keys
+// configured). Unmarshal also returns it for pdata payloads, mirroring the
+// offered request so queue size accounting stays symmetric. MergeSplit and
+// pushEncodedRequest convert it on first use, on the consumer goroutine.
 type pdataRequest[T any] struct {
 	data    T
 	e       *elasticsearchExporter
@@ -355,10 +334,45 @@ type encodableRequest interface {
 	toEncoded(ctx context.Context) (*encodedRequest, error)
 }
 
-// newPdataConverter builds the ingest-time converter for the legacy-format
-// path: it wraps the pdata payload without encoding it. itemsCount and
-// bytesSize report the payload's record count and proto size for the queue
-// sizers; marshal writes the legacy pdatareq on-disk format.
+// pdataRefCounter implements the queue's reference counting: the memory queue
+// refs a request on Offer and unrefs it after consume, so pdata held by a
+// queued request is not reclaimed by proto pooling. ref/unref cover a
+// pdataRequest's payload; refMetrics/unrefMetrics cover the deferred metric
+// payloads an encodedRequest can hold.
+type pdataRefCounter[T any] struct {
+	ref, unref               func(T)
+	refMetrics, unrefMetrics func(pmetric.Metrics)
+}
+
+func (c pdataRefCounter[T]) Ref(req xexporterhelper.Request) {
+	c.count(req, c.ref, c.refMetrics)
+}
+
+func (c pdataRefCounter[T]) Unref(req xexporterhelper.Request) {
+	c.count(req, c.unref, c.unrefMetrics)
+}
+
+func (pdataRefCounter[T]) count(req xexporterhelper.Request, f func(T), fMetrics func(pmetric.Metrics)) {
+	switch r := req.(type) {
+	case *pdataRequest[T]:
+		f(r.data)
+	case *encodedRequest:
+		if !r.holdsPdata {
+			return
+		}
+		for i := range r.items {
+			it := &r.items[i]
+			if it.kind == itemKindDeferredMetrics && it.doc == nil {
+				fMetrics(it.deferredMetrics)
+			}
+		}
+	}
+}
+
+// newPdataConverter builds the ingest-time converter for the pdata-format
+// path: it wraps the payload without encoding it. itemsCount and bytesSize
+// report record count and proto size for the queue sizers; marshal writes the
+// pdatareq on-disk format.
 func newPdataConverter[T any](
 	e *elasticsearchExporter,
 	encode recordEncoder[T],
@@ -387,8 +401,7 @@ func (r *pdataRequest[T]) toEncoded(ctx context.Context) (*encodedRequest, error
 }
 
 // MergeSplit converts the payload to an *encodedRequest (and other too, if it
-// is also a pdataRequest) and delegates. It is only reached when a pdataRequest
-// bypasses the persistent queue's marshal round-trip.
+// is also a pdataRequest) and delegates.
 func (r *pdataRequest[T]) MergeSplit(
 	ctx context.Context,
 	maxSize int,
@@ -408,11 +421,10 @@ func (r *pdataRequest[T]) MergeSplit(
 	return enc.MergeSplit(ctx, maxSize, sizerType, req)
 }
 
-// pushEncodedRequest is the request consumer (runs on the sending-queue consumer
-// goroutines). It assembles the pre-encoded bulk items into bulk indexer
-// sessions and flushes them. Normally no serialization happens here; a
-// pdataRequest that bypassed the persistent queue's marshal round-trip is
-// converted on the spot (matching the legacy encode-on-consumer profile).
+// pushEncodedRequest is the request consumer (runs on the sending-queue
+// consumer goroutines). It assembles the pre-encoded bulk items into bulk
+// indexer sessions and flushes them; a pdataRequest that reached here
+// unconverted is converted on the spot.
 func (e *elasticsearchExporter) pushEncodedRequest(ctx context.Context, req xexporterhelper.Request) error {
 	r, ok := req.(*encodedRequest)
 	if !ok {
@@ -428,21 +440,17 @@ func (e *elasticsearchExporter) pushEncodedRequest(ctx context.Context, req xexp
 	return e.consumeEncodedItems(ctx, r.items)
 }
 
-// consumeEncodedItems assembles already-encoded items into the appropriate bulk
-// indexer sessions and flushes them. Plain items are streamed as-is; mergeable
-// metric documents with the same group identity are merged by byte splicing,
-// and deferred ECS-mode metrics are grouped and encoded here over the whole
-// batch — both restoring the batch-wide document grouping of the legacy pdata
-// path.
+// consumeEncodedItems assembles already-encoded items into the appropriate
+// bulk indexer sessions and flushes them. Plain items stream as-is; mergeable
+// metric documents with the same group identity merge by byte splicing, and
+// deferred ECS-mode metrics are grouped and encoded over the whole batch.
 func (e *elasticsearchExporter) consumeEncodedItems(ctx context.Context, items []encodedItem) error {
 	var sessions encodedSessionSet
 	sessions.init(e)
 	defer sessions.end()
 
-	// A single reader is reused across items: the bulk indexer reads the body
-	// synchronously in Add (it copies into its own buffer), so the reader can be
-	// reset for the next item. This avoids a *bytes.Reader allocation per item on
-	// the consumer critical path.
+	// One reader reused for all items: the bulk indexer copies the body
+	// synchronously in Add, so no per-item reader allocation is needed.
 	var reader bytes.Reader
 	var errs []error
 	var merger metricsDocMerger
@@ -476,6 +484,22 @@ func (e *elasticsearchExporter) consumeEncodedItems(ctx context.Context, items [
 	}
 
 	for _, group := range merger.groups {
+		if group.conflicted {
+			// Overlapping names in the group: emit the original documents
+			// unmerged so no two synthesized documents share a TSDB identity.
+			for _, item := range group.items {
+				reader.Reset(item.doc)
+				if err := sessions.get(ctx, item).Add(
+					ctx, item.index, item.docID, item.pipeline, &reader, item.dynamicTemplates, item.action,
+				); err != nil {
+					if cerr := ctx.Err(); cerr != nil {
+						return cerr
+					}
+					errs = append(errs, err)
+				}
+			}
+			continue
+		}
 		item := group.items[0]
 		body, dynamicTemplates := group.assemble(&reader)
 		session := sessions.get(ctx, item)
@@ -541,17 +565,20 @@ func (e *elasticsearchExporter) consumeDeferredMetrics(ctx context.Context, sess
 		}
 	}
 	if len(groups.byIndex) > 0 || len(groups.validationErrs) > 0 {
-		perRecordErrs, err := e.emitMetricsGroups(ctx, sessionSink{sessions: sessions}, groups)
+		encodeErrs, addErrs, err := e.emitMetricsGroups(ctx, sessionSink{sessions: sessions}, groups)
 		if err != nil {
 			errs = append(errs, err)
 		}
-		if len(perRecordErrs) > 0 {
-			// Deterministic per-record failures: retrying cannot fix them, so
-			// log and count them instead of returning (matching the converter).
+		// Add errors can be transient bulk-indexer failures; return them so
+		// the request stays retryable.
+		errs = append(errs, addErrs...)
+		if len(encodeErrs) > 0 {
+			// Deterministic encoding failures: log and count instead of
+			// returning, since retrying cannot fix them.
 			e.set.Logger.Warn("dropping records that failed to encode",
-				zap.Int("dropped_records", len(perRecordErrs)),
-				zap.Error(errors.Join(perRecordErrs...)))
-			e.telemetryBuilder.ElasticsearchDocsProcessed.Add(ctx, int64(len(perRecordErrs)),
+				zap.Int("dropped_records", len(encodeErrs)),
+				zap.Error(errors.Join(encodeErrs...)))
+			e.telemetryBuilder.ElasticsearchDocsProcessed.Add(ctx, int64(len(encodeErrs)),
 				metric.WithAttributeSet(attribute.NewSet(append(
 					getAttributesFromMetadataKeys(ctx, e.config.MetadataKeys),
 					withOutcome("failed_client"),
@@ -568,12 +595,18 @@ type mergeGroupKey struct {
 	key         metricgroup.HashKey
 }
 
-// metricsDocGroup accumulates mergeable metric items that share a group key and
-// have pairwise-disjoint metric names.
+// metricsDocGroup accumulates the mergeable metric items sharing one group
+// key. Items merge while their metric names stay pairwise disjoint; the first
+// overlap marks the group conflicted, and a conflicted group emits every item
+// unmerged. Emitted name sets are then either the merged union or exactly as
+// ingested, so the merger never synthesizes two documents with the same TSDB
+// identity (which Elasticsearch would deduplicate).
 type metricsDocGroup struct {
-	items    []*encodedItem
-	names    map[string]struct{}
-	docCount uint64
+	items          []*encodedItem
+	names          map[string]struct{}
+	docCount       uint64
+	docCountHinted bool
+	conflicted     bool
 }
 
 func (g *metricsDocGroup) disjoint(names []string) bool {
@@ -586,23 +619,27 @@ func (g *metricsDocGroup) disjoint(names []string) bool {
 }
 
 func (g *metricsDocGroup) append(item *encodedItem) {
+	if !g.conflicted && (len(g.items) == 0 || g.disjoint(item.metricNames)) {
+		for _, n := range item.metricNames {
+			g.names[n] = struct{}{}
+		}
+		// Last-hinted-wins, as the serializer does per document: a hinted
+		// zero overrides an earlier value and omits the field.
+		if item.docCountHinted {
+			g.docCount = item.docCount
+			g.docCountHinted = true
+		}
+	} else {
+		g.conflicted = true
+	}
 	g.items = append(g.items, item)
-	for _, n := range item.metricNames {
-		g.names[n] = struct{}{}
-	}
-	if item.docCount != 0 {
-		g.docCount = item.docCount
-	}
 }
 
-// assemble returns the document body for the group and its dynamic templates.
-// A single-item group streams its doc untouched via reader. A merged group is
-// spliced: the first doc up to the end of its "metrics" fields, the other
-// items' fragments joined with commas, and a freshly written tail whose
-// _metric_names_hash covers the sorted union of names — byte-identical to the
-// tail of a document serialized from the merged data points, so the merged
-// document keeps the same TSDB identity the legacy whole-batch encoding
-// produced.
+// assemble returns the group's document body and dynamic templates. A
+// single-item group streams its doc untouched; a merged group splices the
+// first doc's prefix, the other fragments comma-joined, and a fresh tail whose
+// _metric_names_hash covers the sorted name union — byte-identical to
+// serializing the merged data points, preserving the TSDB identity.
 func (g *metricsDocGroup) assemble(reader *bytes.Reader) (io.WriterTo, map[string]string) {
 	first := g.items[0]
 	if len(g.items) == 1 {
@@ -640,29 +677,25 @@ func (g *metricsDocGroup) assemble(reader *bytes.Reader) (io.WriterTo, map[strin
 
 var jsonComma = []byte{','}
 
-// metricsDocMerger buckets mergeable metric items by group key. Items whose
-// metric names overlap an existing bucket start a new one (identical name sets
-// are true duplicates that Elasticsearch TSDB deduplicates, as before).
+// metricsDocMerger buckets mergeable metric items by group key, one group per
+// key; see metricsDocGroup for the conflict semantics.
 type metricsDocMerger struct {
-	byKey  map[mergeGroupKey][]*metricsDocGroup
+	byKey  map[mergeGroupKey]*metricsDocGroup
 	groups []*metricsDocGroup // in insertion order
 }
 
 func (m *metricsDocMerger) add(item *encodedItem) {
 	key := mergeGroupKey{mappingMode: item.mappingMode, index: item.index, key: item.groupKey}
 	if m.byKey == nil {
-		m.byKey = make(map[mergeGroupKey][]*metricsDocGroup)
+		m.byKey = make(map[mergeGroupKey]*metricsDocGroup)
 	}
-	for _, g := range m.byKey[key] {
-		if g.disjoint(item.metricNames) {
-			g.append(item)
-			return
-		}
+	g, ok := m.byKey[key]
+	if !ok {
+		g = &metricsDocGroup{names: make(map[string]struct{}, len(item.metricNames))}
+		m.byKey[key] = g
+		m.groups = append(m.groups, g)
 	}
-	g := &metricsDocGroup{names: make(map[string]struct{}, len(item.metricNames))}
 	g.append(item)
-	m.byKey[key] = append(m.byKey[key], g)
-	m.groups = append(m.groups, g)
 }
 
 // multiSliceWriterTo streams a sequence of byte slices, used to assemble merged
@@ -732,10 +765,9 @@ func (e *elasticsearchExporter) profilingIndexer(t sessionTarget) bulkIndexer {
 }
 
 // docSink consumes one freshly-encoded document together with its bulk-item
-// metadata. It is the seam that lets a single per-record encode path serve both
-// exporter paths: the streaming sink hands the document straight to a bulk
-// indexer session (legacy/consumer path), while the buffering sink copies it into
-// an encodedItem for the request queue (early/ingest path). The sink takes
+// metadata. It is the seam that lets one per-record encode path serve both
+// sinks: sessionSink streams the document straight to a bulk indexer session,
+// itemSink copies it into an encodedItem for the request queue. The sink takes
 // ownership of doc.
 type docSink interface {
 	add(ctx context.Context, item encodedItem, doc encodedDoc) error
@@ -763,10 +795,9 @@ func rawDoc(buf *bytes.Buffer) encodedDoc {
 	return encodedDoc{writerTo: buf, buf: buf}
 }
 
-// sessionSink streams encoded documents directly to bulk indexer sessions. It is
-// used by the legacy push path (encoding on the consumer goroutine) and keeps the
-// original streaming memory profile: one pooled buffer in flight at a time, freed
-// by the bulk indexer as it reads it.
+// sessionSink streams encoded documents directly to bulk indexer sessions,
+// keeping one pooled buffer in flight at a time, freed by the bulk indexer as
+// it reads it.
 type sessionSink struct {
 	sessions *encodedSessionSet
 }
@@ -779,9 +810,9 @@ func (s sessionSink) add(ctx context.Context, item encodedItem, doc encodedDoc) 
 	)
 }
 
-// itemSink copies encoded documents into encodedItems for the request queue. It
-// is used by the early path (encoding at ingest), materializing each document so
-// it can outlive the pooled buffer and travel through the sending queue.
+// itemSink copies encoded documents into encodedItems for the request queue,
+// materializing each document so it can outlive the pooled buffer and travel
+// through the sending queue.
 type itemSink struct {
 	items []encodedItem
 }
@@ -826,16 +857,14 @@ const (
 	earlyEncodedVersion byte = 1
 )
 
-// encodedEncoding is the generic queue Encoding for *encodedRequest. It marshals
-// early-encoded requests to the compact wire format below, and on Unmarshal
-// transparently handles both that format and legacy pdata payloads written by a
-// previous (pdata-based) persistent queue. Legacy payloads are decoded and
-// re-encoded through the same ingest converter so the consumer only ever sees an
-// *encodedRequest. The type parameter T is the signal's pdata type; it only
-// appears on the legacy-decode path, so encodedEncoding[T] still satisfies the
-// non-generic queue.Encoding[Request] the queue expects.
+// encodedEncoding is the queue Encoding for the request pipeline: it marshals
+// encodedRequests to the wire format below and pdataRequests to the pdata
+// format, and Unmarshal reads both. Pdata payloads are wrapped, not eagerly
+// converted, so the read-back request reports the same sizes it was offered
+// with, keeping queue size accounting symmetric. The type parameter T is the
+// signal's pdata type, used only on the pdata paths.
 type encodedEncoding[T any] struct {
-	convert        xexporterhelper.RequestConverterFunc[T]
+	wrapPdata      xexporterhelper.RequestConverterFunc[T]  // from newPdataConverter; never fails
 	unmarshalCtx   func([]byte) (context.Context, T, error) // e.g. pdatareq.UnmarshalLogs
 	unmarshalPlain func([]byte) (T, error)                  // e.g. (&plog.ProtoUnmarshaler{}).UnmarshalLogs
 }
@@ -865,9 +894,8 @@ func (enc encodedEncoding[T]) Unmarshal(b []byte) (context.Context, xexporterhel
 		return context.Background(), r, nil
 	}
 
-	// Legacy pdata payload written by a previous version's pdata-based persistent
-	// queue. Decode it (preserving the request context so mapping-mode-from-
-	// metadata still resolves) and re-encode it into an *encodedRequest.
+	// Pdata payload: decode it, preserving the request context, and wrap it
+	// so the read-back request reports the same sizes it was offered with.
 	ctx, data, err := enc.unmarshalCtx(b)
 	if errors.Is(err, pdatareq.ErrInvalidFormat) {
 		// Even older payload without the request-context wrapper.
@@ -877,7 +905,7 @@ func (enc encodedEncoding[T]) Unmarshal(b []byte) (context.Context, xexporterhel
 	if err != nil {
 		return context.Background(), nil, fmt.Errorf("elasticsearchexporter: failed to unmarshal legacy payload: %w", err)
 	}
-	req, err := enc.convert(ctx, data)
+	req, err := enc.wrapPdata(ctx, data)
 	if err != nil {
 		return context.Background(), nil, err
 	}
@@ -897,14 +925,14 @@ func (enc encodedEncoding[T]) Unmarshal(b []byte) (context.Context, xexporterhel
 //	    uvarint metricNamesCount
 //	    repeated: string name
 //	    uvarint docCount
+//	    uvarint docCountHinted (0 or 1)
 //	  string  index, docID, pipeline, action        (uvarint length + bytes)
 //	  uvarint dynamicTemplatesCount
 //	  repeated: string key, string value
 //	  bytes   doc                                    (uvarint length + bytes)
 //
-// A deferred-metrics item created at ingest holds its payload as pdata
-// (deferredMetrics) and is proto-marshaled here, on persist; its doc bytes are
-// the full original payload, which the consumer re-walks and filters.
+// A deferred-metrics item created at ingest holds its payload as pdata and is
+// proto-marshaled here, on persist, restricted to its deferred scopes.
 func marshalEncodedRequest(r *encodedRequest) ([]byte, error) {
 	buf := make([]byte, 0, r.bytesSize+16*len(r.items)+8)
 	buf = append(buf, earlyEncodedMagic, earlyEncodedVersion)
@@ -926,6 +954,11 @@ func marshalEncodedRequest(r *encodedRequest) ([]byte, error) {
 				buf = appendLenPrefixedString(buf, name)
 			}
 			buf = binary.AppendUvarint(buf, it.docCount)
+			var hinted uint64
+			if it.docCountHinted {
+				hinted = 1
+			}
+			buf = binary.AppendUvarint(buf, hinted)
 		}
 		buf = appendLenPrefixedString(buf, it.index)
 		buf = appendLenPrefixedString(buf, it.docID)
@@ -973,29 +1006,40 @@ func filteredDeferredMetrics(m pmetric.Metrics, scopes []scopeRef) pmetric.Metri
 	return out
 }
 
-// deferredMetricsSize approximates the proto size of the payload restricted to
-// the given scopes: each parent ResourceMetrics' full size minus its
-// non-deferred scopes. It slightly overcounts (the removed scopes' framing
-// bytes remain included), which is the safe direction for byte thresholds.
-// scopes must be in walk order (as returned by collectMetricsGroups).
+// deferredMetricsSize approximates the proto size of the payload restricted
+// to the given scopes (which must be in walk order): each parent
+// ResourceMetrics' size minus its non-deferred scopes, plus the outer
+// per-ResourceMetrics field framing. The estimate is guaranteed >= the
+// persisted filtered payload's size, the safe direction for byte thresholds.
 func deferredMetricsSize(m pmetric.Metrics, scopes []scopeRef) int {
 	sizer := pmetric.ProtoMarshaler{}
 	var size int
 	for i := 0; i < len(scopes); {
 		rmIdx := scopes[i].rm
 		rm := m.ResourceMetrics().At(rmIdx)
-		size += sizer.ResourceMetricsSize(rm)
+		rmSize := sizer.ResourceMetricsSize(rm)
 		deferred := make(map[int]struct{})
 		for ; i < len(scopes) && scopes[i].rm == rmIdx; i++ {
 			deferred[scopes[i].sm] = struct{}{}
 		}
 		for smIdx, sm := range rm.ScopeMetrics().All() {
 			if _, ok := deferred[smIdx]; !ok {
-				size -= sizer.ScopeMetricsSize(sm)
+				rmSize -= sizer.ScopeMetricsSize(sm)
 			}
 		}
+		size += rmSize + 1 + uvarintLen(uint64(rmSize))
 	}
 	return size
+}
+
+// uvarintLen returns the encoded length of v as a protobuf varint.
+func uvarintLen(v uint64) int {
+	n := 1
+	for v >= 0x80 {
+		v >>= 7
+		n++
+	}
+	return n
 }
 
 func unmarshalEncodedRequest(b []byte) (*encodedRequest, error) {
@@ -1004,10 +1048,8 @@ func unmarshalEncodedRequest(b []byte) (*encodedRequest, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Each item encodes to at least a few bytes (two uvarints plus five
-	// length prefixes), so a count larger than len(b) is corrupt. Reject it, and
-	// cap the preallocation hint so a corrupt-but-in-range count can't drive a
-	// huge up-front allocation before the per-item decode fails.
+	// A count larger than len(b) is corrupt; also cap the preallocation hint
+	// so an in-range corrupt count cannot drive a huge up-front allocation.
 	if count > uint64(len(b)) {
 		return nil, errors.New("elasticsearchexporter: corrupt early-encoded payload: item count exceeds payload size")
 	}
@@ -1038,7 +1080,7 @@ func unmarshalEncodedRequest(b []byte) (*encodedRequest, error) {
 		var groupKey metricgroup.HashKey
 		var fragStart, fragEnd uint64
 		var metricNames []string
-		var docCount uint64
+		var docCount, docCountHinted uint64
 		if itemKind(kind) == itemKindMergeableMetrics {
 			var kr, ks, kd uint64
 			if kr, err = r.uvarint(); err != nil {
@@ -1061,9 +1103,8 @@ func unmarshalEncodedRequest(b []byte) (*encodedRequest, error) {
 			if err != nil {
 				return nil, err
 			}
-			// Each name takes at least one length-prefix byte; cap the
-			// preallocation hint so a corrupt count can't drive a huge
-			// allocation before the per-name decode fails.
+			// Cap the preallocation hint so a corrupt count cannot drive a
+			// huge allocation before the per-name decode fails.
 			if nameCount > uint64(len(b)) {
 				return nil, errors.New("elasticsearchexporter: corrupt early-encoded payload: metric name count exceeds payload size")
 			}
@@ -1077,6 +1118,12 @@ func unmarshalEncodedRequest(b []byte) (*encodedRequest, error) {
 			}
 			if docCount, err = r.uvarint(); err != nil {
 				return nil, err
+			}
+			if docCountHinted, err = r.uvarint(); err != nil {
+				return nil, err
+			}
+			if docCountHinted > 1 {
+				return nil, errors.New("elasticsearchexporter: corrupt early-encoded payload: invalid doc count hint flag")
 			}
 		}
 		index, err := r.string()
@@ -1137,6 +1184,7 @@ func unmarshalEncodedRequest(b []byte) (*encodedRequest, error) {
 			fragEnd:          int(fragEnd),
 			metricNames:      metricNames,
 			docCount:         docCount,
+			docCountHinted:   docCountHinted == 1,
 		})
 	}
 	return newEncodedRequest(items), nil
@@ -1181,9 +1229,8 @@ func (r *byteReader) slice() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Compare against the remaining bytes rather than r.pos+n, which would
-	// overflow for an attacker/corruption-controlled n near 2^64 and defeat the
-	// bounds check. r.pos <= len(r.b) is an invariant maintained by every read.
+	// Compare against the remaining bytes: r.pos+n would overflow for a
+	// corruption-controlled n near 2^64 and defeat the bounds check.
 	if n > uint64(len(r.b)-r.pos) {
 		return nil, errShortEarlyEncodedPayload
 	}

@@ -13,13 +13,10 @@ import (
 	"go.opentelemetry.io/collector/consumer/consumererror"
 )
 
-// unwrapPermanent strips a single consumererror permanent wrapper from err, if
-// present. The request-converter path (newConsumeLogs in exporterhelper) always
-// re-wraps a converter error with consumererror.NewPermanent, so returning an
-// already-permanent error from the converter would double the "Permanent error:"
-// prefix relative to the legacy pushLogsData path. getRequestMappingMode and
-// getScopeMappingMode return permanent errors (they are also used by the push
-// paths), so we unwrap them here to keep the surfaced error identical.
+// unwrapPermanent strips a single consumererror permanent wrapper from err,
+// if present. The request-converter path in exporterhelper re-wraps converter
+// errors as permanent, so passing an already-permanent error through would
+// double the "Permanent error:" prefix in the surfaced message.
 func unwrapPermanent(err error) error {
 	if consumererror.IsPermanent(err) {
 		if inner := errors.Unwrap(err); inner != nil {

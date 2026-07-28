@@ -28,6 +28,10 @@ type MetricsDocInfo struct {
 	MetricNames []string
 	// DocCount is the document's _doc_count, 0 if absent.
 	DocCount uint64
+	// DocCountHinted reports whether any data point carried the doc-count mapping hint,
+	// so merging can replicate last-hinted-wins semantics (a hinted zero overrides an
+	// earlier value).
+	DocCountHinted bool
 }
 
 func (*Serializer) SerializeMetrics(resource pcommon.Resource, resourceSchemaURL string, scope pcommon.InstrumentationScope, scopeSchemaURL string, dataPoints []datapoints.DataPoint, validationErrors *[]error, idx elasticsearch.Index, buf *bytes.Buffer) (map[string]string, MetricsDocInfo, error) {
@@ -60,6 +64,7 @@ func serializeDataPoints(w *jsonWriter, dataPoints []datapoints.DataPoint, valid
 
 	dynamicTemplates := make(map[string]string, len(dataPoints))
 	var docCount uint64
+	var docCountHinted bool
 	metricNamesSet := make(map[string]bool, len(dataPoints))
 	metricNames := make([]string, 0, len(dataPoints))
 	firstMetric := true
@@ -83,6 +88,7 @@ func serializeDataPoints(w *jsonWriter, dataPoints []datapoints.DataPoint, valid
 		value, err := dp.Value()
 		if dp.HasMappingHint(elasticsearch.HintDocCount) {
 			docCount = dp.DocCount()
+			docCountHinted = true
 		}
 		if err != nil {
 			*validationErrors = append(*validationErrors, err)
@@ -103,10 +109,11 @@ func serializeDataPoints(w *jsonWriter, dataPoints []datapoints.DataPoint, valid
 	writeMetricsTail(w, docCount, metricNames, first)
 
 	return dynamicTemplates, MetricsDocInfo{
-		FragStart:   fragStart,
-		FragEnd:     fragEnd,
-		MetricNames: metricNames,
-		DocCount:    docCount,
+		FragStart:      fragStart,
+		FragEnd:        fragEnd,
+		MetricNames:    metricNames,
+		DocCount:       docCount,
+		DocCountHinted: docCountHinted,
 	}
 }
 
@@ -128,12 +135,11 @@ func writeMetricsTail(w *jsonWriter, docCount uint64, sortedNames []string, firs
 	_ = w.writeStringFieldSkipDefault("_metric_names_hash", strconv.FormatUint(hasher.Sum64(), 16), first)
 }
 
-// AppendMergedMetricsTail appends the tail of a merged metrics document to buf,
-// following the last spliced "metrics" field: it closes the metrics object,
-// writes _doc_count (if non-zero) and _metric_names_hash, and closes the
-// document. sortedNames must be sorted; the output is byte-identical to the
-// tail SerializeMetrics produces for the same inputs, so a merged document has
-// the same TSDB identity as one serialized from the merged data points.
+// AppendMergedMetricsTail appends a merged document's tail after its last
+// spliced "metrics" field: it closes the metrics object, writes _doc_count
+// (if non-zero) and _metric_names_hash, and closes the document. sortedNames
+// must be sorted; the output is byte-identical to SerializeMetrics' tail for
+// the same inputs, so merged documents keep the same TSDB identity.
 func AppendMergedMetricsTail(buf *bytes.Buffer, docCount uint64, sortedNames []string) {
 	w := newJSONWriter(buf)
 	writeMetricsTail(&w, docCount, sortedNames, false)

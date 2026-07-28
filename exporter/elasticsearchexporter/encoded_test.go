@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/client"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/configcompression"
@@ -36,9 +37,13 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pprofile"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/collector/pdata/xpdata/pref"
 	pdatareq "go.opentelemetry.io/collector/pdata/xpdata/request"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/elasticsearch"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/metricgroup"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/serializer/otelserializer"
 )
 
 // newPersistentQueueFallbackTest builds a config with a persistent sending queue
@@ -60,7 +65,7 @@ func newPersistentQueueFallbackTest(t *testing.T) (*Config, component.Host, *bul
 		cfg.Mapping.Mode = "otel"
 		cfg.QueueBatchConfig.Get().NumConsumers = 1
 		cfg.QueueBatchConfig.Get().Batch.Get().FlushTimeout = 10 * time.Millisecond
-		// Enable the persistent queue, which triggers the legacy pdata path.
+		// A persistent queue with the gate off makes ingest wrap raw pdata.
 		cfg.QueueBatchConfig.Get().StorageID = &storageID
 	})
 
@@ -529,7 +534,7 @@ func TestGateOffEncoding_WritesLegacyReadsBoth(t *testing.T) {
 	})
 	require.False(t, useEarlyEncoding(cfg)) // persistent queue, gate off
 
-	qbs := requestQueueBatchSettings(cfg, newEncodedConverter(exp, exp.encodeLogRecords),
+	qbs := requestQueueBatchSettings(cfg, newPdataLogsConverter(exp), pref.RefLogs, pref.UnrefLogs,
 		pdatareq.UnmarshalLogs, (&plog.ProtoUnmarshaler{}).UnmarshalLogs)
 	enc := qbs.Encoding.(encodedEncoding[plog.Logs])
 
@@ -540,10 +545,17 @@ func TestGateOffEncoding_WritesLegacyReadsBoth(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, earlyEncodedMagic, legacyBytes[0])
 
-	// ...and reads back as a fully encoded request.
+	// ...and reads back as a pdataRequest with the SAME items/bytes sizes as
+	// the offered request — the symmetry the persistent queue's size accounting
+	// depends on — which converts to encoded items downstream.
 	_, req, err := enc.Unmarshal(legacyBytes)
 	require.NoError(t, err)
-	require.Equal(t, 2, req.(*encodedRequest).ItemsCount())
+	require.IsType(t, &pdataRequest[plog.Logs]{}, req)
+	require.Equal(t, pReq.ItemsCount(), req.ItemsCount())
+	require.Equal(t, pReq.BytesSize(), req.BytesSize())
+	encReq, err := req.(encodableRequest).toEncoded(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 2, encReq.ItemsCount())
 
 	// A leftover early-encoded payload (written while the gate was on) is also
 	// read, even though the gate is off.
@@ -920,7 +932,7 @@ func BenchmarkQueuedMemory(b *testing.B) {
 	exp := startBenchExporter(b, newBenchESServer(b, nil).URL, func(c *Config) string { return c.LogsIndex })
 	ctx := context.Background()
 	converter := newEncodedConverter(exp, exp.encodeLogRecords)
-	encoding := encodedEncoding[plog.Logs]{convert: converter}
+	encoding := encodedEncoding[plog.Logs]{wrapPdata: newPdataLogsConverter(exp)}
 	protoMarshaler := &plog.ProtoMarshaler{}
 
 	retained := func(b *testing.B, build func() any) {
@@ -1251,6 +1263,19 @@ func assertReadsLegacyPayload[T any](
 	data T,
 ) {
 	t.Helper()
+	// Unmarshal wraps pdata payloads in a pdataRequest (mirroring the offered
+	// request so queue size accounting stays symmetric); the wrapped request
+	// must convert into non-empty encoded items downstream.
+	assertConverts := func(t *testing.T, req xexporterhelper.Request) {
+		t.Helper()
+		require.Positive(t, req.ItemsCount())
+		conv, ok := req.(encodableRequest)
+		require.True(t, ok, "expected a downstream-convertible request, got %T", req)
+		encReq, err := conv.toEncoded(context.Background())
+		require.NoError(t, err)
+		require.Positive(t, encReq.ItemsCount())
+	}
+
 	t.Run("pdatareq wrapped payload", func(t *testing.T) {
 		legacy, err := marshalCtx(context.Background(), data)
 		require.NoError(t, err)
@@ -1258,7 +1283,7 @@ func assertReadsLegacyPayload[T any](
 
 		_, req, err := enc.Unmarshal(legacy)
 		require.NoError(t, err)
-		require.Positive(t, req.(*encodedRequest).ItemsCount())
+		assertConverts(t, req)
 	})
 
 	t.Run("plain protobuf payload", func(t *testing.T) {
@@ -1267,7 +1292,7 @@ func assertReadsLegacyPayload[T any](
 
 		_, req, err := enc.Unmarshal(legacy)
 		require.NoError(t, err)
-		require.Positive(t, req.(*encodedRequest).ItemsCount())
+		assertConverts(t, req)
 	})
 }
 
@@ -1285,7 +1310,7 @@ func TestRequestEncoding_ReadsLegacyPayload(t *testing.T) {
 	t.Run("logs", func(t *testing.T) {
 		exp := newExp(t, cfg.LogsIndex)
 		enc := encodedEncoding[plog.Logs]{
-			convert:        newEncodedConverter(exp, exp.encodeLogRecords),
+			wrapPdata:      newPdataConverter(exp, exp.encodeLogRecords, plog.Logs.LogRecordCount, (&plog.ProtoMarshaler{}).LogsSize, pdatareq.MarshalLogs),
 			unmarshalCtx:   pdatareq.UnmarshalLogs,
 			unmarshalPlain: (&plog.ProtoUnmarshaler{}).UnmarshalLogs,
 		}
@@ -1295,7 +1320,7 @@ func TestRequestEncoding_ReadsLegacyPayload(t *testing.T) {
 	t.Run("metrics", func(t *testing.T) {
 		exp := newExp(t, cfg.MetricsIndex)
 		enc := encodedEncoding[pmetric.Metrics]{
-			convert:        newEncodedConverter(exp, exp.encodeMetricRecords),
+			wrapPdata:      newPdataConverter(exp, exp.encodeMetricRecords, pmetric.Metrics.DataPointCount, (&pmetric.ProtoMarshaler{}).MetricsSize, pdatareq.MarshalMetrics),
 			unmarshalCtx:   pdatareq.UnmarshalMetrics,
 			unmarshalPlain: (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics,
 		}
@@ -1305,7 +1330,7 @@ func TestRequestEncoding_ReadsLegacyPayload(t *testing.T) {
 	t.Run("traces", func(t *testing.T) {
 		exp := newExp(t, cfg.TracesIndex)
 		enc := encodedEncoding[ptrace.Traces]{
-			convert:        newEncodedConverter(exp, exp.encodeTraceRecords),
+			wrapPdata:      newPdataConverter(exp, exp.encodeTraceRecords, ptrace.Traces.SpanCount, (&ptrace.ProtoMarshaler{}).TracesSize, pdatareq.MarshalTraces),
 			unmarshalCtx:   pdatareq.UnmarshalTraces,
 			unmarshalPlain: (&ptrace.ProtoUnmarshaler{}).UnmarshalTraces,
 		}
@@ -1315,7 +1340,7 @@ func TestRequestEncoding_ReadsLegacyPayload(t *testing.T) {
 	t.Run("profiles", func(t *testing.T) {
 		exp := newExp(t, "")
 		enc := encodedEncoding[pprofile.Profiles]{
-			convert:        newEncodedConverter(exp, exp.encodeProfileRecords),
+			wrapPdata:      newPdataConverter(exp, exp.encodeProfileRecords, pprofile.Profiles.SampleCount, (&pprofile.ProtoMarshaler{}).ProfilesSize, pdatareq.MarshalProfiles),
 			unmarshalCtx:   pdatareq.UnmarshalProfiles,
 			unmarshalPlain: (&pprofile.ProtoUnmarshaler{}).UnmarshalProfiles,
 		}
@@ -1414,4 +1439,543 @@ func TestConsumeEncodedItems_DisallowedMappingMode(t *testing.T) {
 		consumeErr = exp.consumeEncodedItems(context.Background(), items)
 	})
 	require.ErrorContains(t, consumeErr, "not in mapping::allowed_modes")
+}
+
+// TestConverter_CanceledContextDoesNotAbortConversion: conversion is pure CPU,
+// so a canceled context on its own must not abort it — the payload converts
+// and is enqueued, matching main where enqueueing preceded any encoding.
+func TestConverter_CanceledContextDoesNotAbortConversion(t *testing.T) {
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoints = []string{"http://localhost:9200"}
+	})
+	exp, err := newExporter(cfg, exportertest.NewNopSettings(metadata.Type), cfg.LogsIndex)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req, err := newEncodedConverter(exp, exp.encodeLogRecords)(ctx, benchLogs(3))
+	require.NoError(t, err)
+	require.Equal(t, 3, req.ItemsCount())
+}
+
+// TestConverter_CanceledContextDoesNotMaskRealError: when conversion fails
+// while the context is also canceled, the surfaced error (which exporterhelper
+// logs in its "Dropping data" message) must be the real cause, not
+// "context canceled".
+func TestConverter_CanceledContextDoesNotMaskRealError(t *testing.T) {
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoints = []string{"http://localhost:9200"}
+	})
+	exp, err := newExporter(cfg, exportertest.NewNopSettings(metadata.Type), cfg.LogsIndex)
+	require.NoError(t, err)
+
+	ctx := client.NewContext(context.Background(), client.Info{
+		Metadata: client.NewMetadata(map[string][]string{"X-Elastic-Mapping-Mode": {"no-such-mode"}}),
+	})
+	ctx, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err = newEncodedConverter(exp, exp.encodeLogRecords)(ctx, benchLogs(1))
+	require.Error(t, err)
+	require.NotErrorIs(t, err, context.Canceled)
+	require.ErrorContains(t, err, "invalid context mapping mode")
+}
+
+// newMetricsMergeExporter builds a started exporter against a bulk-recording
+// server, for exercising encodeMetricRecords + consumeEncodedItems end to end.
+func newMetricsMergeExporter(t *testing.T) (*elasticsearchExporter, *bulkRecorder) {
+	rec := newBulkRecorder()
+	server := newESTestServer(t, func(docs []itemRequest) ([]itemResponse, error) {
+		rec.Record(docs)
+		return itemsAllOK(docs)
+	})
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoints = []string{server.URL}
+	})
+	exp, err := newExporter(cfg, exportertest.NewNopSettings(metadata.Type), cfg.MetricsIndex)
+	require.NoError(t, err)
+	require.NoError(t, exp.Start(context.Background(), componenttest.NewNopHost()))
+	t.Cleanup(func() { require.NoError(t, exp.Shutdown(context.Background())) })
+	return exp, rec
+}
+
+// buildGauges builds a metrics payload with one resource/scope and one gauge
+// data point per name, all sharing the same timestamp and attributes so they
+// belong to a single document group. mode optionally sets the scope mapping
+// mode attribute (e.g. "ecs"); empty means the default (otel).
+func buildGauges(mode string, ts time.Time, names []string, values []float64) pmetric.Metrics {
+	m := pmetric.NewMetrics()
+	rm := m.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "merge-test")
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("merge-scope")
+	if mode != "" {
+		sm.Scope().Attributes().PutStr(elasticsearch.MappingModeAttributeName, mode)
+	}
+	for i, name := range names {
+		metric := sm.Metrics().AppendEmpty()
+		metric.SetName(name)
+		dp := metric.SetEmptyGauge().DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+		dp.SetDoubleValue(values[i])
+		dp.Attributes().PutStr("host.name", "host-1")
+	}
+	return m
+}
+
+func encodeMetricsPayload(t *testing.T, exp *elasticsearchExporter, m pmetric.Metrics) []encodedItem {
+	items, perRecordErrs, err := exp.encodeMetricRecords(context.Background(), m)
+	require.NoError(t, err)
+	require.Empty(t, perRecordErrs)
+	return items
+}
+
+func decodeSingleDoc(t *testing.T, rec *bulkRecorder) map[string]any {
+	docs := rec.WaitItems(1)
+	require.Len(t, docs, 1)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(docs[0].Document, &doc))
+	return doc
+}
+
+// TestConsumeEncodedItems_MergesOTelMetricDocsAcrossPayloads is the
+// differential property behind the merge design: a document group split across
+// two ingest payloads must produce, after consume-time merging, a document
+// semantically identical to encoding the unsplit payload — including
+// _metric_names_hash, i.e. the same TSDB identity.
+func TestConsumeEncodedItems_MergesOTelMetricDocsAcrossPayloads(t *testing.T) {
+	ts := time.Unix(1719000000, 0).UTC()
+
+	expFull, recFull := newMetricsMergeExporter(t)
+	full := buildGauges("", ts, []string{"m.a", "m.b"}, []float64{1.5, 2.5})
+	require.NoError(t, expFull.consumeEncodedItems(context.Background(), encodeMetricsPayload(t, expFull, full)))
+	fullDoc := decodeSingleDoc(t, recFull)
+
+	expSplit, recSplit := newMetricsMergeExporter(t)
+	items := encodeMetricsPayload(t, expSplit, buildGauges("", ts, []string{"m.a"}, []float64{1.5}))
+	items = append(items, encodeMetricsPayload(t, expSplit, buildGauges("", ts, []string{"m.b"}, []float64{2.5}))...)
+	require.Len(t, items, 2)
+	require.Equal(t, itemKindMergeableMetrics, items[0].kind)
+	require.NoError(t, expSplit.consumeEncodedItems(context.Background(), items))
+	splitDoc := decodeSingleDoc(t, recSplit)
+
+	require.Equal(t, fullDoc, splitDoc)
+	require.NotEmpty(t, fullDoc["_metric_names_hash"])
+	metrics, ok := splitDoc["metrics"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, map[string]any{"m.a": 1.5, "m.b": 2.5}, metrics)
+}
+
+// TestConsumeEncodedItems_DuplicateMetricNamesNotMerged: items whose metric
+// name sets overlap must stay separate documents (identical duplicates are
+// deduplicated server-side by TSDB).
+func TestConsumeEncodedItems_DuplicateMetricNamesNotMerged(t *testing.T) {
+	ts := time.Unix(1719000000, 0).UTC()
+	exp, rec := newMetricsMergeExporter(t)
+
+	items := encodeMetricsPayload(t, exp, buildGauges("", ts, []string{"m.a"}, []float64{1}))
+	items = append(items, encodeMetricsPayload(t, exp, buildGauges("", ts, []string{"m.a"}, []float64{2}))...)
+	require.NoError(t, exp.consumeEncodedItems(context.Background(), items))
+	docs := rec.WaitItems(2)
+	require.Len(t, docs, 2)
+}
+
+// TestConsumeEncodedItems_DeferredECSMetricsGroupAcrossPayloads: ECS-mode
+// scopes are deferred as pdata and grouped at consume time, so a group split
+// across payloads still becomes one document, identical to encoding the
+// unsplit payload.
+func TestConsumeEncodedItems_DeferredECSMetricsGroupAcrossPayloads(t *testing.T) {
+	ts := time.Unix(1719000000, 0).UTC()
+
+	expFull, recFull := newMetricsMergeExporter(t)
+	full := buildGauges("ecs", ts, []string{"metric.a", "metric.b"}, []float64{1.5, 2.5})
+	fullItems := encodeMetricsPayload(t, expFull, full)
+	require.Len(t, fullItems, 1)
+	require.Equal(t, itemKindDeferredMetrics, fullItems[0].kind)
+	// The payload is held by reference — nothing is copied or serialized at
+	// ingest. All scopes are deferred, so deferredScopes stays nil (whole
+	// payload) and the size is the exact proto size.
+	require.Nil(t, fullItems[0].doc)
+	require.Nil(t, fullItems[0].deferredScopes)
+	require.Positive(t, fullItems[0].deferredMetrics.ResourceMetrics().Len())
+	require.Equal(t, (&pmetric.ProtoMarshaler{}).MetricsSize(full), fullItems[0].size())
+	require.NoError(t, expFull.consumeEncodedItems(context.Background(), fullItems))
+	fullDoc := decodeSingleDoc(t, recFull)
+
+	expSplit, recSplit := newMetricsMergeExporter(t)
+	items := encodeMetricsPayload(t, expSplit, buildGauges("ecs", ts, []string{"metric.a"}, []float64{1.5}))
+	items = append(items, encodeMetricsPayload(t, expSplit, buildGauges("ecs", ts, []string{"metric.b"}, []float64{2.5}))...)
+	require.Len(t, items, 2)
+	require.NoError(t, expSplit.consumeEncodedItems(context.Background(), items))
+	splitDoc := decodeSingleDoc(t, recSplit)
+
+	require.Equal(t, fullDoc, splitDoc)
+}
+
+// TestMetricsDocGroupAssemble exercises the byte-splicing assembly directly:
+// empty fragments are skipped without stray commas, _doc_count survives, and
+// the result is valid JSON containing the union of metric fields.
+func TestMetricsDocGroupAssemble(t *testing.T) {
+	mk := func(frag string, names []string, docCount uint64, hinted bool) *encodedItem {
+		const prefix = `{"@timestamp":1,"metrics":{`
+		var buf bytes.Buffer
+		buf.WriteString(prefix)
+		buf.WriteString(frag)
+		fragStart := len(prefix)
+		fragEnd := buf.Len()
+		otelserializer.AppendMergedMetricsTail(&buf, docCount, names)
+		return &encodedItem{
+			kind:           itemKindMergeableMetrics,
+			mappingMode:    MappingOTel,
+			index:          "metrics-generic",
+			fragStart:      fragStart,
+			fragEnd:        fragEnd,
+			metricNames:    names,
+			docCount:       docCount,
+			docCountHinted: hinted,
+			doc:            buf.Bytes(),
+		}
+	}
+
+	assemble := func(t *testing.T, m *metricsDocMerger) map[string]any {
+		t.Helper()
+		require.Len(t, m.groups, 1)
+		require.False(t, m.groups[0].conflicted)
+		var reader bytes.Reader
+		body, _ := m.groups[0].assemble(&reader)
+		var out bytes.Buffer
+		_, err := body.WriteTo(&out)
+		require.NoError(t, err)
+		var doc map[string]any
+		require.NoError(t, json.Unmarshal(out.Bytes(), &doc), "assembled doc is not valid JSON: %s", out.String())
+		return doc
+	}
+
+	var merger metricsDocMerger
+	merger.add(mk(`"a":1`, []string{"a"}, 0, false))
+	merger.add(mk(``, nil, 0, false)) // all data points failed validation
+	merger.add(mk(`"b":2`, []string{"b"}, 7, true))
+	doc := assemble(t, &merger)
+	require.Equal(t, map[string]any{"a": 1.0, "b": 2.0}, doc["metrics"])
+	require.Equal(t, 7.0, doc["_doc_count"])
+	require.NotEmpty(t, doc["_metric_names_hash"])
+
+	// Last-hinted-wins, as on main: a later hinted zero overrides an earlier
+	// value and the field is omitted, matching what serializing the merged
+	// data points would produce.
+	var hintedZero metricsDocMerger
+	hintedZero.add(mk(`"a":1`, []string{"a"}, 5, true))
+	hintedZero.add(mk(`"b":2`, []string{"b"}, 0, true))
+	doc = assemble(t, &hintedZero)
+	require.NotContains(t, doc, "_doc_count")
+}
+
+// TestConsumeEncodedItems_OverlappingNamesDisableGroupMerging pins the fix for
+// synthesized-identity collisions: items {a}, {a,b}, {b} under one group key
+// must NOT merge into two documents that both end up with names {a,b} (which
+// share a TSDB identity, so Elasticsearch would silently keep only one).
+// Instead the conflicted group emits every original document, whose distinct
+// name sets give distinct _metric_names_hash values — all three are stored.
+func TestConsumeEncodedItems_OverlappingNamesDisableGroupMerging(t *testing.T) {
+	ts := time.Unix(1719000000, 0).UTC()
+	exp, rec := newMetricsMergeExporter(t)
+
+	items := encodeMetricsPayload(t, exp, buildGauges("", ts, []string{"m.a"}, []float64{1}))
+	items = append(items, encodeMetricsPayload(t, exp, buildGauges("", ts, []string{"m.a", "m.b"}, []float64{1, 2}))...)
+	items = append(items, encodeMetricsPayload(t, exp, buildGauges("", ts, []string{"m.b"}, []float64{2}))...)
+	require.NoError(t, exp.consumeEncodedItems(context.Background(), items))
+
+	docs := rec.WaitItems(3)
+	require.Len(t, docs, 3)
+	hashes := make(map[string]int)
+	for _, d := range docs {
+		var doc map[string]any
+		require.NoError(t, json.Unmarshal(d.Document, &doc))
+		hash, ok := doc["_metric_names_hash"].(string)
+		require.True(t, ok)
+		hashes[hash]++
+	}
+	require.Len(t, hashes, 3, "every emitted document must have a distinct TSDB identity: %v", hashes)
+}
+
+// TestRequestEncoding_RoundTripMergeFields verifies the persistent-queue wire
+// format round-trips the merge metadata and deferred payloads.
+func TestRequestEncoding_RoundTripMergeFields(t *testing.T) {
+	enc := encodedEncoding[pmetric.Metrics]{}
+	items := []encodedItem{
+		{
+			index:          "metrics-a",
+			action:         "create",
+			mappingMode:    MappingOTel,
+			kind:           itemKindMergeableMetrics,
+			groupKey:       metricgroup.NewHashKey(1, 2, 3),
+			fragStart:      5,
+			fragEnd:        9,
+			metricNames:    []string{"a", "b"},
+			docCount:       7,
+			docCountHinted: true,
+			doc:            []byte(`{"m":{"a":1}}`),
+		},
+		{
+			action:      "create",
+			mappingMode: MappingECS,
+			kind:        itemKindDeferredMetrics,
+			doc:         []byte{1, 2, 3},
+		},
+	}
+	b, err := enc.Marshal(context.Background(), newEncodedRequest(items))
+	require.NoError(t, err)
+
+	_, req, err := enc.Unmarshal(b)
+	require.NoError(t, err)
+	require.Equal(t, items, req.(*encodedRequest).items)
+}
+
+// TestConsumeEncodedItems_MixedModePayload: a payload mixing an OTel scope and
+// an ECS scope produces one mergeable doc item plus one deferred item holding
+// the FULL original payload; the deferred consume walk must filter to
+// ECS-resolving scopes only, so exactly two documents come out — no duplicate
+// of the OTel scope.
+func TestConsumeEncodedItems_MixedModePayload(t *testing.T) {
+	ts := time.Unix(1719000000, 0).UTC()
+	exp, rec := newMetricsMergeExporter(t)
+
+	m := buildGauges("", ts, []string{"otel.metric"}, []float64{1})
+	ecsSM := m.ResourceMetrics().At(0).ScopeMetrics().AppendEmpty()
+	ecsSM.Scope().SetName("ecs-scope")
+	ecsSM.Scope().Attributes().PutStr(elasticsearch.MappingModeAttributeName, "ecs")
+	metric := ecsSM.Metrics().AppendEmpty()
+	metric.SetName("ecs.metric")
+	dp := metric.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+	dp.SetDoubleValue(2)
+
+	items := encodeMetricsPayload(t, exp, m)
+	require.Len(t, items, 2)
+	require.Equal(t, itemKindMergeableMetrics, items[0].kind)
+	require.Equal(t, itemKindDeferredMetrics, items[1].kind)
+
+	require.NoError(t, exp.consumeEncodedItems(context.Background(), items))
+	docs := rec.WaitItems(2)
+	require.Len(t, docs, 2)
+
+	var otelDocs, ecsDocs int
+	for _, d := range docs {
+		var doc map[string]any
+		require.NoError(t, json.Unmarshal(d.Document, &doc))
+		if _, ok := doc["metrics"]; ok {
+			otelDocs++
+		} else {
+			// The ECS serializer de-dots "ecs.metric" into nested objects.
+			require.Equal(t, map[string]any{"metric": 2.0}, doc["ecs"])
+			ecsDocs++
+		}
+	}
+	require.Equal(t, 1, otelDocs)
+	require.Equal(t, 1, ecsDocs)
+
+	// Sizing covers only the deferred scope, not the whole payload: at least
+	// the exact filtered proto size (the approximation may overcount slightly)
+	// and strictly less than the full payload's proto size.
+	require.Len(t, items[1].deferredScopes, 1)
+	fullSize := (&pmetric.ProtoMarshaler{}).MetricsSize(m)
+	filteredExact := (&pmetric.ProtoMarshaler{}).MetricsSize(filteredDeferredMetrics(m, items[1].deferredScopes))
+	require.GreaterOrEqual(t, items[1].deferredSize, filteredExact)
+	require.Less(t, items[1].deferredSize, fullSize)
+
+	// Persistence also covers only the deferred scope: the OTel scope already
+	// exists as an encoded doc item and must not be stored twice.
+	enc := encodedEncoding[pmetric.Metrics]{}
+	b, err := enc.Marshal(context.Background(), newEncodedRequest(items))
+	require.NoError(t, err)
+	_, req, err := enc.Unmarshal(b)
+	require.NoError(t, err)
+	restored := req.(*encodedRequest).items
+	require.Len(t, restored, 2)
+	persisted, err := (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics(restored[1].doc)
+	require.NoError(t, err)
+	require.Equal(t, 1, persisted.ResourceMetrics().Len())
+	require.Equal(t, 1, persisted.ResourceMetrics().At(0).ScopeMetrics().Len())
+	require.Equal(t, "ecs-scope", persisted.ResourceMetrics().At(0).ScopeMetrics().At(0).Scope().Name())
+
+	// Draining the restored items still produces exactly the same two docs.
+	expDisk, recDisk := newMetricsMergeExporter(t)
+	require.NoError(t, expDisk.consumeEncodedItems(context.Background(), restored))
+	require.Len(t, recDisk.WaitItems(2), 2)
+}
+
+// TestRequestEncoding_DeferredMetricsMarshaledLazily: a deferred item holds
+// pdata in memory and is proto-marshaled only when the persistent queue writes
+// it; reading it back and consuming it produces the same document.
+func TestRequestEncoding_DeferredMetricsMarshaledLazily(t *testing.T) {
+	ts := time.Unix(1719000000, 0).UTC()
+	enc := encodedEncoding[pmetric.Metrics]{}
+
+	expMem, recMem := newMetricsMergeExporter(t)
+	items := encodeMetricsPayload(t, expMem, buildGauges("ecs", ts, []string{"metric.a"}, []float64{1.5}))
+	require.Len(t, items, 1)
+	require.Nil(t, items[0].doc)
+
+	b, err := enc.Marshal(context.Background(), newEncodedRequest(items))
+	require.NoError(t, err)
+	_, req, err := enc.Unmarshal(b)
+	require.NoError(t, err)
+	restored := req.(*encodedRequest).items
+	require.Len(t, restored, 1)
+	require.NotNil(t, restored[0].doc)
+	require.Equal(t, itemKindDeferredMetrics, restored[0].kind)
+
+	// In-memory item and disk round-tripped item must produce the same doc.
+	require.NoError(t, expMem.consumeEncodedItems(context.Background(), items))
+	memDoc := decodeSingleDoc(t, recMem)
+
+	expDisk, recDisk := newMetricsMergeExporter(t)
+	require.NoError(t, expDisk.consumeEncodedItems(context.Background(), restored))
+	diskDoc := decodeSingleDoc(t, recDisk)
+	require.Equal(t, memDoc, diskDoc)
+}
+
+// TestRequestEncoding_CorruptMergeFields: invalid fragment offsets and item
+// kinds in a persisted payload must error, not panic.
+func TestRequestEncoding_CorruptMergeFields(t *testing.T) {
+	enc := encodedEncoding[pmetric.Metrics]{}
+	valid := []encodedItem{{
+		index:       "metrics-a",
+		action:      "create",
+		mappingMode: MappingOTel,
+		kind:        itemKindMergeableMetrics,
+		groupKey:    metricgroup.NewHashKey(1, 2, 3),
+		fragStart:   5,
+		fragEnd:     20, // exceeds len(doc)==13; Marshal doesn't validate, Unmarshal must
+		metricNames: []string{"a"},
+		doc:         []byte(`{"m":{"a":1}}`),
+	}}
+	b, err := enc.Marshal(context.Background(), newEncodedRequest(valid))
+	require.NoError(t, err)
+	_, _, err = enc.Unmarshal(b)
+	require.ErrorContains(t, err, "invalid metric fragment offsets")
+}
+
+// TestMetricsConverter_UnsupportedModeFailsConversion: when the resolved
+// mapping mode cannot encode the signal at all (raw mode does not support
+// metrics), every group fails deterministically and the conversion must
+// return an error rather than reporting success while dropping 100% of the
+// payload.
+func TestMetricsConverter_UnsupportedModeFailsConversion(t *testing.T) {
+	ts := time.Unix(1719000000, 0).UTC()
+	exp, _ := newMetricsMergeExporter(t)
+
+	m := buildGauges("raw", ts, []string{"m.a"}, []float64{1})
+	req, err := newEncodedConverter(exp, exp.encodeMetricRecords)(context.Background(), m)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "does not support metrics")
+	require.Nil(t, req)
+}
+
+// failingSink stands in for a streaming sink whose add fails transiently
+// (e.g. a forced bulk flush against an unreachable Elasticsearch).
+type failingSink struct{ err error }
+
+func (f failingSink) add(context.Context, encodedItem, encodedDoc) error { return f.err }
+
+// TestEmitMetricsGroups_SinkAddErrorsStayRetryable: sink.add errors must be
+// returned separately from deterministic encode errors — the deferred-metrics
+// consume path returns them to the queue for retry rather than dropping them
+// as "failed to encode".
+func TestEmitMetricsGroups_SinkAddErrorsStayRetryable(t *testing.T) {
+	exp, _ := newMetricsMergeExporter(t)
+	groups := newMetricsGroups()
+	m := buildGauges("", time.Unix(1719000000, 0).UTC(), []string{"m.a"}, []float64{1})
+	_, _, err := exp.collectMetricsGroups(context.Background(), groups, m, nil, nil)
+	require.NoError(t, err)
+
+	sinkErr := errors.New("transient flush failure")
+	encodeErrs, addErrs, err := exp.emitMetricsGroups(context.Background(), failingSink{err: sinkErr}, groups)
+	require.NoError(t, err)
+	require.Empty(t, encodeErrs)
+	require.Len(t, addErrs, 1)
+	require.ErrorIs(t, addErrs[0], sinkErr)
+}
+
+// TestPdataRefCounter: the queue's Ref/Unref must reach every pdata payload a
+// request holds by reference — a pdataRequest's data and an encodedRequest's
+// not-yet-marshaled deferred metric payloads — and skip disk-read deferred
+// items (doc set, no held pdata) and plain doc items.
+func TestPdataRefCounter(t *testing.T) {
+	var refs, unrefs, metricRefs, metricUnrefs int
+	c := pdataRefCounter[pmetric.Metrics]{
+		ref:          func(pmetric.Metrics) { refs++ },
+		unref:        func(pmetric.Metrics) { unrefs++ },
+		refMetrics:   func(pmetric.Metrics) { metricRefs++ },
+		unrefMetrics: func(pmetric.Metrics) { metricUnrefs++ },
+	}
+
+	exp, _ := newMetricsMergeExporter(t)
+	ts := time.Unix(1719000000, 0).UTC()
+
+	// pdataRequest: counted via the signal funcs.
+	pReq, err := newPdataConverter(exp, exp.encodeMetricRecords,
+		pmetric.Metrics.DataPointCount, (&pmetric.ProtoMarshaler{}).MetricsSize, pdatareq.MarshalMetrics,
+	)(context.Background(), buildGauges("ecs", ts, []string{"m.a"}, []float64{1}))
+	require.NoError(t, err)
+	c.Ref(pReq)
+	c.Unref(pReq)
+	require.Equal(t, 1, refs)
+	require.Equal(t, 1, unrefs)
+
+	// encodedRequest with a held deferred payload: counted via the metrics funcs.
+	items := encodeMetricsPayload(t, exp, buildGauges("ecs", ts, []string{"m.a"}, []float64{1}))
+	encReq := newEncodedRequest(items)
+	require.True(t, encReq.holdsPdata)
+	c.Ref(encReq)
+	c.Unref(encReq)
+	require.Equal(t, 1, metricRefs)
+	require.Equal(t, 1, metricUnrefs)
+
+	// Plain doc items and disk-read deferred items hold no pdata: not counted.
+	docItems := encodeMetricsPayload(t, exp, buildGauges("", ts, []string{"m.b"}, []float64{2}))
+	diskDeferred := items[0]
+	diskDeferred.doc = []byte{1, 2, 3}
+	diskDeferred.deferredMetrics = pmetric.Metrics{}
+	noPdata := newEncodedRequest(append(docItems, diskDeferred))
+	require.False(t, noPdata.holdsPdata)
+	c.Ref(noPdata)
+	c.Unref(noPdata)
+	require.Equal(t, 1, metricRefs)
+	require.Equal(t, 1, metricUnrefs)
+	require.Equal(t, 1, refs)
+	require.Equal(t, 1, unrefs)
+}
+
+// TestDeferredMetricsSize_OverEstimatesPersistedSize pins the sizing
+// invariant: the estimate must never under-count the persisted filtered
+// payload. The payload shape (a whole ResourceMetrics excluded, another
+// deferred) exercises the per-ResourceMetrics outer framing bytes that
+// ResourceMetricsSize excludes.
+func TestDeferredMetricsSize_OverEstimatesPersistedSize(t *testing.T) {
+	ts := time.Unix(1719000000, 0).UTC()
+	exp, _ := newMetricsMergeExporter(t)
+
+	// rm0: OTel-only scope (excluded entirely); rm1: ECS scope (deferred).
+	m := buildGauges("", ts, []string{"otel.metric"}, []float64{1})
+	rm1 := m.ResourceMetrics().AppendEmpty()
+	rm1.Resource().Attributes().PutStr("service.name", "merge-test-2")
+	sm := rm1.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("ecs-scope")
+	sm.Scope().Attributes().PutStr(elasticsearch.MappingModeAttributeName, "ecs")
+	metric := sm.Metrics().AppendEmpty()
+	metric.SetName("ecs.metric")
+	dp := metric.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+	dp.SetDoubleValue(2)
+
+	items := encodeMetricsPayload(t, exp, m)
+	require.Len(t, items, 2)
+	deferredItem := items[1]
+	require.Equal(t, itemKindDeferredMetrics, deferredItem.kind)
+	require.Len(t, deferredItem.deferredScopes, 1)
+
+	persisted, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(
+		filteredDeferredMetrics(deferredItem.deferredMetrics, deferredItem.deferredScopes))
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, deferredItem.deferredSize, len(persisted))
 }

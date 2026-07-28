@@ -25,6 +25,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pprofile"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/collector/pdata/xpdata/pref"
 	pdatareq "go.opentelemetry.io/collector/pdata/xpdata/request"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/metadata"
@@ -120,12 +121,13 @@ func createLogsExporter(
 		return nil, err
 	}
 
-	qbs := requestQueueBatchSettings(cf, newEncodedConverter(exp, exp.encodeLogRecords),
+	pdataConverter := newPdataConverter(exp, exp.encodeLogRecords,
+		plog.Logs.LogRecordCount, (&plog.ProtoMarshaler{}).LogsSize, pdatareq.MarshalLogs)
+	qbs := requestQueueBatchSettings(cf, pdataConverter, pref.RefLogs, pref.UnrefLogs,
 		pdatareq.UnmarshalLogs, (&plog.ProtoUnmarshaler{}).UnmarshalLogs)
 	converter := newEncodedConverter(exp, exp.encodeLogRecords)
 	if !useEarlyEncoding(cf) {
-		converter = newPdataConverter(exp, exp.encodeLogRecords,
-			plog.Logs.LogRecordCount, (&plog.ProtoMarshaler{}).LogsSize, pdatareq.MarshalLogs)
+		converter = pdataConverter
 	}
 	return xexporterhelper.NewLogsRequest(ctx, set, converter, exp.pushEncodedRequest,
 		exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
@@ -145,12 +147,13 @@ func createMetricsExporter(
 		return nil, err
 	}
 
-	qbs := requestQueueBatchSettings(cf, newEncodedConverter(exp, exp.encodeMetricRecords),
+	pdataConverter := newPdataConverter(exp, exp.encodeMetricRecords,
+		pmetric.Metrics.DataPointCount, (&pmetric.ProtoMarshaler{}).MetricsSize, pdatareq.MarshalMetrics)
+	qbs := requestQueueBatchSettings(cf, pdataConverter, pref.RefMetrics, pref.UnrefMetrics,
 		pdatareq.UnmarshalMetrics, (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics)
 	converter := newEncodedConverter(exp, exp.encodeMetricRecords)
 	if !useEarlyEncoding(cf) {
-		converter = newPdataConverter(exp, exp.encodeMetricRecords,
-			pmetric.Metrics.DataPointCount, (&pmetric.ProtoMarshaler{}).MetricsSize, pdatareq.MarshalMetrics)
+		converter = pdataConverter
 	}
 	return xexporterhelper.NewMetricsRequest(ctx, set, converter, exp.pushEncodedRequest,
 		exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
@@ -169,12 +172,13 @@ func createTracesExporter(ctx context.Context,
 		return nil, err
 	}
 
-	qbs := requestQueueBatchSettings(cf, newEncodedConverter(exp, exp.encodeTraceRecords),
+	pdataConverter := newPdataConverter(exp, exp.encodeTraceRecords,
+		ptrace.Traces.SpanCount, (&ptrace.ProtoMarshaler{}).TracesSize, pdatareq.MarshalTraces)
+	qbs := requestQueueBatchSettings(cf, pdataConverter, pref.RefTraces, pref.UnrefTraces,
 		pdatareq.UnmarshalTraces, (&ptrace.ProtoUnmarshaler{}).UnmarshalTraces)
 	converter := newEncodedConverter(exp, exp.encodeTraceRecords)
 	if !useEarlyEncoding(cf) {
-		converter = newPdataConverter(exp, exp.encodeTraceRecords,
-			ptrace.Traces.SpanCount, (&ptrace.ProtoMarshaler{}).TracesSize, pdatareq.MarshalTraces)
+		converter = pdataConverter
 	}
 	return xexporterhelper.NewTracesRequest(ctx, set, converter, exp.pushEncodedRequest,
 		exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
@@ -197,33 +201,40 @@ func createProfilesExporter(
 		return nil, err
 	}
 
-	qbs := requestQueueBatchSettings(cf, newEncodedConverter(exp, exp.encodeProfileRecords),
+	pdataConverter := newPdataConverter(exp, exp.encodeProfileRecords,
+		pprofile.Profiles.SampleCount, (&pprofile.ProtoMarshaler{}).ProfilesSize, pdatareq.MarshalProfiles)
+	qbs := requestQueueBatchSettings(cf, pdataConverter, pref.RefProfiles, pref.UnrefProfiles,
 		pdatareq.UnmarshalProfiles, (&pprofile.ProtoUnmarshaler{}).UnmarshalProfiles)
 	converter := newEncodedConverter(exp, exp.encodeProfileRecords)
 	if !useEarlyEncoding(cf) {
-		converter = newPdataConverter(exp, exp.encodeProfileRecords,
-			pprofile.Profiles.SampleCount, (&pprofile.ProtoMarshaler{}).ProfilesSize, pdatareq.MarshalProfiles)
+		converter = pdataConverter
 	}
 	return xexporterhelper.NewProfilesRequest(ctx, set, converter, exp.pushEncodedRequest,
 		exporterhelperOptions(cf, exp.Start, exp.Shutdown, qbs)...)
 }
 
-// requestQueueBatchSettings builds the QueueBatchSettings for the request-based
-// pipeline. When a persistent sending queue is configured it installs the
-// custom Encoding, which marshals early-encoded requests to the compact wire
-// format and pdata-wrapping requests to the legacy pdata format, and on
-// Unmarshal transparently reads both; see encoded.go. converter is the
-// early-encoding converter used to re-encode pdata payloads on drain.
+// requestQueueBatchSettings builds the QueueBatchSettings for the request
+// pipeline: reference counting for requests that hold pdata, and — when a
+// persistent queue is configured — the Encoding that writes both request
+// formats and reads both back (see encoded.go). pdataConverter wraps pdata
+// payloads read from disk so the request keeps the sizing it was offered with.
 func requestQueueBatchSettings[T any](
 	cf *Config,
-	converter xexporterhelper.RequestConverterFunc[T],
+	pdataConverter xexporterhelper.RequestConverterFunc[T],
+	ref, unref func(T),
 	unmarshalCtx func([]byte) (context.Context, T, error),
 	unmarshalPlain func([]byte) (T, error),
 ) xexporterhelper.QueueBatchSettings {
 	var qbs xexporterhelper.QueueBatchSettings
+	// The memory queue refs on Offer and unrefs after consume; requests can
+	// hold pdata by reference (pdataRequest, deferred metric items).
+	qbs.ReferenceCounter = pdataRefCounter[T]{
+		ref: ref, unref: unref,
+		refMetrics: pref.RefMetrics, unrefMetrics: pref.UnrefMetrics,
+	}
 	if cf.QueueBatchConfig.HasValue() && cf.QueueBatchConfig.Get().StorageID != nil {
 		qbs.Encoding = encodedEncoding[T]{
-			convert:        converter,
+			wrapPdata:      pdataConverter,
 			unmarshalCtx:   unmarshalCtx,
 			unmarshalPlain: unmarshalPlain,
 		}

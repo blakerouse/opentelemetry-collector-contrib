@@ -101,15 +101,13 @@ func (e *elasticsearchExporter) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// The push*Data functions are the legacy (consumer-goroutine) path: they stream
-// each record to bulk indexer sessions via a sessionSink and flush. The
-// encode*Records functions are the early (ingest-goroutine) path: they collect
-// each record into []encodedItem via an itemSink for the request queue. Both are
-// thin wrappers over pushStreaming/collectItems and the per-signal emit*
-// iteration, so document encoding lives in one place; only the sink differs.
+// The push*Data functions stream each record to bulk indexer sessions via a
+// sessionSink and flush; the encode*Records functions collect each record into
+// []encodedItem via an itemSink for the request queue. Both wrap the shared
+// per-signal emit* iteration, so document encoding lives in one place.
 
 // pushStreaming runs a per-signal emit against streaming bulk indexer sessions
-// (the legacy path) and flushes. emit is a bound *elasticsearchExporter method.
+// and flushes. emit is a bound *elasticsearchExporter method.
 func pushStreaming[T any](
 	ctx context.Context,
 	e *elasticsearchExporter,
@@ -126,8 +124,8 @@ func pushStreaming[T any](
 	return flushSessions(ctx, &sessions, errs)
 }
 
-// collectItems runs a per-signal emit against a buffering itemSink (the early
-// path), returning the materialized items. capacity is a preallocation hint.
+// collectItems runs a per-signal emit against a buffering itemSink, returning
+// the materialized items. capacity is a preallocation hint.
 func collectItems[T any](
 	ctx context.Context,
 	emit func(context.Context, docSink, T) ([]error, error),
@@ -151,8 +149,8 @@ func (e *elasticsearchExporter) encodeLogRecords(ctx context.Context, ld plog.Lo
 }
 
 // emitLogs iterates ld, encoding each log record and handing it to sink.
-// perRecordErrs are deterministic per-record errors; see recordEncoder for how
-// each path handles them. A returned error aborts the whole batch.
+// perRecordErrs are deterministic per-record errors; a returned error aborts
+// the whole payload.
 func (e *elasticsearchExporter) emitLogs(ctx context.Context, sink docSink, ld plog.Logs) ([]error, error) {
 	defaultMappingMode, err := e.getRequestMappingMode(ctx)
 	if err != nil {
@@ -225,8 +223,7 @@ func (e *elasticsearchExporter) emitLogRecord(
 }
 
 // flushSessions flushes all bulk indexer sessions started while streaming and
-// joins the flush error into errs, honoring context cancellation. It is the
-// shared tail of the legacy push*Data consumers.
+// joins the flush error into errs, honoring context cancellation.
 func flushSessions(ctx context.Context, sessions *encodedSessionSet, errs []error) error {
 	if err := sessions.flush(ctx); err != nil {
 		if cerr := ctx.Err(); cerr != nil {
@@ -262,23 +259,15 @@ func (e *elasticsearchExporter) encodeMetricRecords(ctx context.Context, metrics
 	if err != nil {
 		return nil, nil, err
 	}
-	perRecordErrs, err := e.emitMetricsGroups(ctx, sink, groups)
+	// itemSink.add never fails, so addErrs stays empty on the ingest path;
+	// merged for completeness.
+	perRecordErrs, addErrs, err := e.emitMetricsGroups(ctx, sink, groups)
 	if err != nil {
 		return nil, nil, err
 	}
-	// ECS-mode scopes are deferred: their documents cannot be merged by byte
-	// splicing (the ECS serializer globally sorts and de-dots fields). The item
-	// holds the original payload by reference — no copy, no serialization — and
-	// records the request-default mapping mode; the consumer re-walks the
-	// payload with that default and encodes only the ECS-resolving scopes,
-	// grouped over the whole batch exactly like the legacy pdata path. Proto
-	// marshaling happens lazily, only if a persistent queue writes the item to
-	// disk. deferredSize is precomputed for the byte sizers (the legacy pdata
-	// path computed the same proto size for its default bytes-based batching).
-	// For a mixed-mode payload, deferredScopes records which scopes were
-	// deferred so sizing and persistence cover only those (the other scopes
-	// already exist as encoded doc items); when every scope was deferred it
-	// stays nil, meaning the whole payload.
+	perRecordErrs = append(perRecordErrs, addErrs...)
+	// ECS docs cannot be byte-spliced (globally sorted, de-dotted fields), so
+	// ECS scopes defer as one pdata-reference item; see encodedItem.deferredMetrics.
 	if len(excluded) > 0 {
 		item := encodedItem{
 			kind:            itemKindDeferredMetrics,
@@ -314,7 +303,8 @@ func (e *elasticsearchExporter) emitMetrics(ctx context.Context, sink docSink, m
 	if _, _, err := e.collectMetricsGroups(ctx, groups, metrics, nil, nil); err != nil {
 		return nil, err
 	}
-	return e.emitMetricsGroups(ctx, sink, groups)
+	encodeErrs, addErrs, err := e.emitMetricsGroups(ctx, sink, groups)
+	return append(encodeErrs, addErrs...), err
 }
 
 // mappingIndexKey identifies a metric document group's routing.
@@ -476,10 +466,11 @@ func (e *elasticsearchExporter) collectMetricsGroups(
 }
 
 // emitMetricsGroups encodes every collected group and hands each document to
-// sink, returning deterministic per-record errors. It also logs the validation
-// errors accumulated during collection.
-func (e *elasticsearchExporter) emitMetricsGroups(ctx context.Context, sink docSink, g *metricsGroups) ([]error, error) {
-	var perRecordErrs []error
+// sink. encodeErrs are deterministic per-record encoding failures; addErrs
+// come from sink.add and can be transient bulk-indexer failures, so callers
+// must keep them retryable. Validation errors accumulated during collection
+// are logged here.
+func (e *elasticsearchExporter) emitMetricsGroups(ctx context.Context, sink docSink, g *metricsGroups) (encodeErrs, addErrs []error, _ error) {
 	for key, groupedDataPoints := range g.byIndex {
 		for hashKey, dpGroup := range groupedDataPoints {
 			buf := e.bufferPool.NewPooledBuffer()
@@ -498,7 +489,7 @@ func (e *elasticsearchExporter) emitMetricsGroups(ctx context.Context, sink docS
 			)
 			if err != nil {
 				buf.Recycle()
-				perRecordErrs = append(perRecordErrs, err)
+				encodeErrs = append(encodeErrs, err)
 				continue
 			}
 			item := encodedItem{
@@ -508,9 +499,8 @@ func (e *elasticsearchExporter) emitMetricsGroups(ctx context.Context, sink docS
 				mappingMode:      key.mappingMode,
 				target:           targetDefault,
 			}
-			// A non-zero FragStart marks a doc the encoder produced in a
-			// splice-mergeable layout (OTel mode); carry the merge metadata so
-			// the consumer can combine same-group docs across payloads.
+			// A non-zero FragStart marks a splice-mergeable doc; carry the
+			// metadata so the consumer can merge same-group docs.
 			if docInfo.FragStart > 0 {
 				item.kind = itemKindMergeableMetrics
 				item.groupKey = hashKey
@@ -518,19 +508,20 @@ func (e *elasticsearchExporter) emitMetricsGroups(ctx context.Context, sink docS
 				item.fragEnd = docInfo.FragEnd
 				item.metricNames = docInfo.MetricNames
 				item.docCount = docInfo.DocCount
+				item.docCountHinted = docInfo.DocCountHinted
 			}
 			if err := sink.add(ctx, item, pooledDoc(buf)); err != nil {
 				if cerr := ctx.Err(); cerr != nil {
-					return nil, cerr
+					return nil, nil, cerr
 				}
-				perRecordErrs = append(perRecordErrs, err)
+				addErrs = append(addErrs, err)
 			}
 		}
 	}
 	if len(g.validationErrs) > 0 {
 		e.set.Logger.Warn("validation errors", zap.Error(errors.Join(g.validationErrs...)))
 	}
-	return perRecordErrs, nil
+	return encodeErrs, addErrs, nil
 }
 
 func (e *elasticsearchExporter) pushTraceData(ctx context.Context, td ptrace.Traces) error {
@@ -769,8 +760,7 @@ func (e *elasticsearchExporter) emitProfiles(ctx context.Context, sink docSink, 
 }
 
 // profileIndexTarget maps a profiling document's target index to the bulk
-// indexer session it should be written to and the bulk action to use. It mirrors
-// the routing in pushProfileRecord.
+// indexer session it should be written to and the bulk action to use.
 func profileIndexTarget(index string) (sessionTarget, string) {
 	switch index {
 	case otelserializer.StackTraceIndex:
@@ -800,7 +790,9 @@ type mappingModeSessions struct {
 }
 
 // StartSession starts a new session for the given mapping mode if one has
-// not yet been started, otherwise it returns the existing session.
+// not yet been started, otherwise it returns the existing session. A mode
+// without a bulk indexer yields an errBulkIndexerSession, not cached in
+// sessionList so Flush does not duplicate its per-item error.
 //
 // Note: this is not safe for concurrent use. It is expected to be used
 // within a single Consume* call.
@@ -810,6 +802,8 @@ func (s *mappingModeSessions) StartSession(ctx context.Context, mappingMode Mapp
 	}
 	indexer := s.indexers[int(mappingMode)]
 	if indexer == nil {
+		// A drained item can carry a mode removed from mapping::allowed_modes
+		// since it was written; fail the item rather than panic on nil.
 		return errBulkIndexerSession{err: fmt.Errorf("mapping mode %q is not in mapping::allowed_modes", mappingMode)}
 	}
 	session := indexer.StartSession(ctx)

@@ -105,7 +105,8 @@ Because records are encoded to their final form at ingest time, "items" — as c
 `otelcol_exporter_send_failed_*` metrics — are Elasticsearch **documents**, not pdata records. Log records map 1:1,
 but each span event becomes its own document (increasing trace counts), metric data points are grouped into one
 document per timestamp and dimensions (decreasing metric counts), and profiles fan out into multiple documents.
-Adjust any `items`-based thresholds or dashboards accordingly.
+ECS-mode metrics are encoded later, on the queue consumer, so a payload's ECS-mode portion counts as a single item
+regardless of its data point or document count. Adjust any `items`-based thresholds or dashboards accordingly.
 
 ### Elasticsearch document routing
 
