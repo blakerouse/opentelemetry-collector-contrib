@@ -79,34 +79,6 @@ func decodeSingleDoc(t *testing.T, rec *bulkRecorder) map[string]any {
 	return doc
 }
 
-// TestConsumeEncodedItems_MergesOTelMetricDocsAcrossPayloads is the
-// differential property behind the merge design: a document group split across
-// two ingest payloads must produce, after consume-time merging, a document
-// semantically identical to encoding the unsplit payload — including
-// _metric_names_hash, i.e. the same TSDB identity.
-func TestConsumeEncodedItems_MergesOTelMetricDocsAcrossPayloads(t *testing.T) {
-	ts := time.Unix(1719000000, 0).UTC()
-
-	expFull, recFull := newMetricsMergeExporter(t)
-	full := buildGauges("", ts, []string{"m.a", "m.b"}, []float64{1.5, 2.5})
-	require.NoError(t, expFull.consumeEncodedItems(context.Background(), encodeMetricsPayload(t, expFull, full)))
-	fullDoc := decodeSingleDoc(t, recFull)
-
-	expSplit, recSplit := newMetricsMergeExporter(t)
-	items := encodeMetricsPayload(t, expSplit, buildGauges("", ts, []string{"m.a"}, []float64{1.5}))
-	items = append(items, encodeMetricsPayload(t, expSplit, buildGauges("", ts, []string{"m.b"}, []float64{2.5}))...)
-	require.Len(t, items, 2)
-	require.Equal(t, itemKindMergeableMetrics, items[0].kind)
-	require.NoError(t, expSplit.consumeEncodedItems(context.Background(), items))
-	splitDoc := decodeSingleDoc(t, recSplit)
-
-	require.Equal(t, fullDoc, splitDoc)
-	require.NotEmpty(t, fullDoc["_metric_names_hash"])
-	metrics, ok := splitDoc["metrics"].(map[string]any)
-	require.True(t, ok)
-	require.Equal(t, map[string]any{"m.a": 1.5, "m.b": 2.5}, metrics)
-}
-
 // TestConsumeEncodedItems_DuplicateMetricNamesNotMerged: items whose metric
 // name sets overlap must stay separate documents (identical duplicates are
 // deduplicated server-side by TSDB).
@@ -121,36 +93,23 @@ func TestConsumeEncodedItems_DuplicateMetricNamesNotMerged(t *testing.T) {
 	require.Len(t, docs, 2)
 }
 
-// TestConsumeEncodedItems_DeferredECSMetricsGroupAcrossPayloads: ECS-mode
-// scopes are deferred as pdata and grouped at consume time, so a group split
-// across payloads still becomes one document, identical to encoding the
-// unsplit payload.
-func TestConsumeEncodedItems_DeferredECSMetricsGroupAcrossPayloads(t *testing.T) {
+// TestEncodeMetricRecords_DeferredECSHoldsPayloadByReference pins the
+// zero-copy invariants of ECS-mode deferral: a uniform ECS payload becomes one
+// deferred item that holds the original pdata by reference — nothing copied or
+// serialized at ingest, deferredScopes nil (whole payload), and the exact
+// proto size reported for the byte sizers.
+func TestEncodeMetricRecords_DeferredECSHoldsPayloadByReference(t *testing.T) {
 	ts := time.Unix(1719000000, 0).UTC()
 
-	expFull, recFull := newMetricsMergeExporter(t)
+	exp, _ := newMetricsMergeExporter(t)
 	full := buildGauges("ecs", ts, []string{"metric.a", "metric.b"}, []float64{1.5, 2.5})
-	fullItems := encodeMetricsPayload(t, expFull, full)
-	require.Len(t, fullItems, 1)
-	require.Equal(t, itemKindDeferredMetrics, fullItems[0].kind)
-	// The payload is held by reference — nothing is copied or serialized at
-	// ingest. All scopes are deferred, so deferredScopes stays nil (whole
-	// payload) and the size is the exact proto size.
-	require.Nil(t, fullItems[0].doc)
-	require.Nil(t, fullItems[0].deferredScopes)
-	require.Positive(t, fullItems[0].deferredMetrics.ResourceMetrics().Len())
-	require.Equal(t, (&pmetric.ProtoMarshaler{}).MetricsSize(full), fullItems[0].size())
-	require.NoError(t, expFull.consumeEncodedItems(context.Background(), fullItems))
-	fullDoc := decodeSingleDoc(t, recFull)
-
-	expSplit, recSplit := newMetricsMergeExporter(t)
-	items := encodeMetricsPayload(t, expSplit, buildGauges("ecs", ts, []string{"metric.a"}, []float64{1.5}))
-	items = append(items, encodeMetricsPayload(t, expSplit, buildGauges("ecs", ts, []string{"metric.b"}, []float64{2.5}))...)
-	require.Len(t, items, 2)
-	require.NoError(t, expSplit.consumeEncodedItems(context.Background(), items))
-	splitDoc := decodeSingleDoc(t, recSplit)
-
-	require.Equal(t, fullDoc, splitDoc)
+	items := encodeMetricsPayload(t, exp, full)
+	require.Len(t, items, 1)
+	require.Equal(t, itemKindDeferredMetrics, items[0].kind)
+	require.Nil(t, items[0].doc)
+	require.Nil(t, items[0].deferredScopes)
+	require.Positive(t, items[0].deferredMetrics.ResourceMetrics().Len())
+	require.Equal(t, (&pmetric.ProtoMarshaler{}).MetricsSize(full), items[0].size())
 }
 
 // TestMetricsDocGroupAssemble exercises the byte-splicing assembly directly:

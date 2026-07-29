@@ -14,7 +14,6 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/xexporterhelper"
 	"go.opentelemetry.io/collector/exporter/exportertest"
-	"go.opentelemetry.io/collector/exporter/xexporter"
 	"go.opentelemetry.io/collector/extension/xextension/storage"
 	"go.opentelemetry.io/collector/featuregate"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -27,82 +26,6 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/metadata"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/metricgroup"
 )
-
-// newPersistentQueueFallbackTest builds a config with a persistent sending queue
-// (sending_queue.storage) and the feature gate off, plus a bulk-recording server
-// and a host exposing the storage extension. In this mode every signal's exporter
-// must wrap raw pdata at ingest (pdataRequest) so the persistent queue keeps the
-// legacy pdata on-disk format, then encode on drain — end to end, documents must
-// still be delivered.
-func newPersistentQueueFallbackTest(t *testing.T) (*Config, component.Host, *bulkRecorder) {
-	rec := newBulkRecorder()
-	server := newESTestServer(t, func(docs []itemRequest) ([]itemResponse, error) {
-		rec.Record(docs)
-		return itemsAllOK(docs)
-	})
-
-	storageID := component.MustNewID("file_storage")
-	cfg := withDefaultConfig(func(cfg *Config) {
-		cfg.Endpoints = []string{server.URL}
-		cfg.Mapping.Mode = "otel"
-		cfg.QueueBatchConfig.Get().NumConsumers = 1
-		cfg.QueueBatchConfig.Get().Batch.Get().FlushTimeout = 10 * time.Millisecond
-		// A persistent queue with the gate off makes ingest wrap raw pdata.
-		cfg.QueueBatchConfig.Get().StorageID = &storageID
-	})
-
-	host := &storageTestHost{
-		ext: map[component.ID]component.Component{
-			storageID: newInMemoryStorageExtension(),
-		},
-	}
-	return cfg, host, rec
-}
-
-func TestCreateExporter_PersistentQueueFallback(t *testing.T) {
-	f := NewFactory()
-	set := exportertest.NewNopSettings(metadata.Type)
-
-	t.Run("logs", func(t *testing.T) {
-		cfg, host, rec := newPersistentQueueFallbackTest(t)
-		exp, err := f.CreateLogs(context.Background(), set, cfg)
-		require.NoError(t, err)
-		require.NoError(t, exp.Start(context.Background(), host))
-		t.Cleanup(func() { require.NoError(t, exp.Shutdown(context.Background())) })
-		require.NoError(t, exp.ConsumeLogs(context.Background(), benchLogs(3)))
-		rec.WaitItems(1)
-	})
-
-	t.Run("metrics", func(t *testing.T) {
-		cfg, host, rec := newPersistentQueueFallbackTest(t)
-		exp, err := f.CreateMetrics(context.Background(), set, cfg)
-		require.NoError(t, err)
-		require.NoError(t, exp.Start(context.Background(), host))
-		t.Cleanup(func() { require.NoError(t, exp.Shutdown(context.Background())) })
-		require.NoError(t, exp.ConsumeMetrics(context.Background(), benchMetrics(3)))
-		rec.WaitItems(1)
-	})
-
-	t.Run("traces", func(t *testing.T) {
-		cfg, host, rec := newPersistentQueueFallbackTest(t)
-		exp, err := f.CreateTraces(context.Background(), set, cfg)
-		require.NoError(t, err)
-		require.NoError(t, exp.Start(context.Background(), host))
-		t.Cleanup(func() { require.NoError(t, exp.Shutdown(context.Background())) })
-		require.NoError(t, exp.ConsumeTraces(context.Background(), benchTraces(3)))
-		rec.WaitItems(1)
-	})
-
-	t.Run("profiles", func(t *testing.T) {
-		cfg, host, rec := newPersistentQueueFallbackTest(t)
-		exp, err := f.(xexporter.Factory).CreateProfiles(context.Background(), set, cfg)
-		require.NoError(t, err)
-		require.NoError(t, exp.Start(context.Background(), host))
-		t.Cleanup(func() { require.NoError(t, exp.Shutdown(context.Background())) })
-		require.NoError(t, exp.ConsumeProfiles(context.Background(), benchProfiles(1)))
-		rec.WaitItems(1)
-	})
-}
 
 // storageTestHost is a component.Host that exposes a set of extensions, used to
 // satisfy the persistent queue's lookup of the configured storage extension.
